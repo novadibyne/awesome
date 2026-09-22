@@ -1,0 +1,79 @@
+# Reusable deployment job for one ring.
+#
+# Uses a deployment job so it binds to an ADO Environment, which is where
+# approval gates live. Note the explicit `checkout: self` - deployment jobs
+# do NOT check out the repo by default, unlike normal jobs.
+
+parameters:
+  - name: ring
+    type: number
+  - name: environmentName
+    type: string
+  - name: displayName
+    type: string
+  - name: pythonVersion
+    type: string
+    default: '3.12'
+  # 'env'      -> keys come from the variable group, mapped below by hand
+  # 'keyvault' -> deploy.py reads Key Vault directly, no per-tenant mapping
+  - name: keySource
+    type: string
+    default: keyvault
+  - name: azureSubscription
+    type: string
+    default: ''
+  - name: keyVaultUrl
+    type: string
+    default: ''
+
+jobs:
+  - deployment: deploy_ring_${{ parameters.ring }}
+    displayName: ${{ parameters.displayName }}
+    environment: ${{ parameters.environmentName }}
+    pool:
+      vmImage: ubuntu-latest
+    variables:
+      - ${{ if eq(parameters.keySource, 'env') }}:
+          - group: elastic-rules-keys
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - checkout: self
+
+            - task: UsePythonVersion@0
+              displayName: Use Python ${{ parameters.pythonVersion }}
+              inputs:
+                versionSpec: ${{ parameters.pythonVersion }}
+
+            - ${{ if eq(parameters.keySource, 'keyvault') }}:
+                - script: pip install -r requirements-azure.txt
+                  displayName: Install dependencies
+
+                - task: AzureCLI@2
+                  displayName: Deploy ring ${{ parameters.ring }}
+                  inputs:
+                    azureSubscription: ${{ parameters.azureSubscription }}
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    # az login from the service connection leaves a session that
+                    # DefaultAzureCredential picks up inside deploy.py.
+                    inlineScript: |
+                      python scripts/deploy.py \
+                        --ring ${{ parameters.ring }} \
+                        --key-source keyvault \
+                        --key-vault-url "${{ parameters.keyVaultUrl }}"
+
+            - ${{ if eq(parameters.keySource, 'env') }}:
+                - script: pip install -r requirements.txt
+                  displayName: Install dependencies
+
+                - script: python scripts/deploy.py --ring ${{ parameters.ring }}
+                  displayName: Deploy ring ${{ parameters.ring }}
+                  # Secret variables are NOT exposed to scripts automatically.
+                  # Every tenant needs a line here. This is the reason the
+                  # keyvault source is the default.
+                  env:
+                    KIBANA_APIKEY_INTERNAL_DEV: $(kibana-apikey-internal-dev)
+                    KIBANA_APIKEY_ACME: $(kibana-apikey-acme)
+                    KIBANA_APIKEY_GLOBEX: $(kibana-apikey-globex)

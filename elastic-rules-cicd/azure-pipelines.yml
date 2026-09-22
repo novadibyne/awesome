@@ -1,0 +1,104 @@
+# Elastic detection rules - CI/CD for Azure DevOps + Azure Repos
+#
+# PR to main     -> Validate stage only. No secrets, no network, no deploy.
+# Merge to main  -> Validate, then ring 0 (auto), ring 1, ring 2.
+#                   Rings 1 and 2 pause for approval via their ADO Environment.
+#
+# Before the first run, see README.md "Azure DevOps setup".
+
+name: rules-$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - rules/*
+      - customers.yml
+      - scripts/*
+      - pipelines/*
+      - azure-pipelines.yml
+
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  pythonVersion: '3.12'
+  # Name of the ADO service connection with access to the Key Vault.
+  azureSubscription: 'elastic-rules-kv'
+  keyVaultUrl: 'https://kv-soc-rules.vault.azure.net/'
+  # 'keyvault' or 'env' - see pipelines/deploy-ring.yml
+  keySource: 'keyvault'
+
+stages:
+  - stage: validate
+    displayName: Validate
+    jobs:
+      - job: validate
+        displayName: Lint and render
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: UsePythonVersion@0
+            displayName: Use Python $(pythonVersion)
+            inputs:
+              versionSpec: $(pythonVersion)
+
+          - script: pip install -r requirements.txt
+            displayName: Install dependencies
+
+          - script: python scripts/validate.py
+            displayName: Validate rules and tenant overlays
+
+          # Proves every tenant still renders a sane rule set before we can
+          # possibly ship anything. Needs no credentials.
+          - script: python scripts/deploy.py --dry-run
+            displayName: Render all tenants (dry run)
+
+  - stage: ring0
+    displayName: Ring 0 - internal canary
+    dependsOn: validate
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - template: pipelines/deploy-ring.yml
+        parameters:
+          ring: 0
+          environmentName: elastic-rules-ring-0
+          displayName: Deploy to internal stack
+          pythonVersion: $(pythonVersion)
+          keySource: $(keySource)
+          azureSubscription: $(azureSubscription)
+          keyVaultUrl: $(keyVaultUrl)
+
+  - stage: ring1
+    displayName: Ring 1 - pilot customers
+    dependsOn: ring0
+    condition: succeeded()
+    jobs:
+      - template: pipelines/deploy-ring.yml
+        parameters:
+          ring: 1
+          environmentName: elastic-rules-ring-1
+          displayName: Deploy to pilot customers
+          pythonVersion: $(pythonVersion)
+          keySource: $(keySource)
+          azureSubscription: $(azureSubscription)
+          keyVaultUrl: $(keyVaultUrl)
+
+  - stage: ring2
+    displayName: Ring 2 - all remaining customers
+    dependsOn: ring1
+    condition: succeeded()
+    jobs:
+      - template: pipelines/deploy-ring.yml
+        parameters:
+          ring: 2
+          environmentName: elastic-rules-ring-2
+          displayName: Deploy to all remaining customers
+          pythonVersion: $(pythonVersion)
+          keySource: $(keySource)
+          azureSubscription: $(azureSubscription)
+          keyVaultUrl: $(keyVaultUrl)

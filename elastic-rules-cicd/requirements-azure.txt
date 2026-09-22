@@ -1,0 +1,4 @@
+# Only needed for --key-source keyvault
+-r requirements.txt
+azure-identity==1.19.0
+azure-keyvault-secrets==4.9.0

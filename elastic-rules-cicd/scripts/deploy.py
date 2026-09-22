@@ -4,9 +4,19 @@
   python scripts/deploy.py --ring 0
   python scripts/deploy.py --customer acme
   python scripts/deploy.py --ring 2 --dry-run
+  python scripts/deploy.py --ring 2 --key-source keyvault --key-vault-url https://kv.vault.azure.net/
 
-Each tenant's API key is read from the env var named in customers.yml.
-Keys live in the CI secret store, never in the repo.
+Two ways to get each tenant's Kibana API key:
+
+  env       (default) read the env var named by that tenant's api_key_env.
+            Simple, but in Azure DevOps every secret has to be mapped into
+            the step's env: block by hand, one line per tenant.
+
+  keyvault  read the secret named by that tenant's key_vault_secret straight
+            out of Azure Key Vault. No per-tenant YAML. Authenticates with
+            DefaultAzureCredential, which picks up the az login session that
+            the AzureCLI@2 task establishes from the service connection.
+            Needs: pip install -r requirements-azure.txt
 """
 
 import argparse
@@ -29,6 +39,29 @@ IMPORT_PARAMS = {
 }
 
 
+def key_from_env(customer):
+    var = customer["api_key_env"]
+    key = os.environ.get(var)
+    if not key:
+        raise RuntimeError(f"env var {var} is not set")
+    return key
+
+
+def key_from_keyvault(customer, client):
+    name = customer.get("key_vault_secret")
+    if not name:
+        raise RuntimeError("no key_vault_secret set for this tenant in customers.yml")
+    return client.get_secret(name).value
+
+
+def make_keyvault_client(vault_url):
+    # Imported lazily so the default env path needs no Azure dependencies.
+    from azure.identity import DefaultAzureCredential
+    from azure.keyvault.secrets import SecretClient
+
+    return SecretClient(vault_url=vault_url, credential=DefaultAzureCredential())
+
+
 def import_url(customer):
     base = customer["kibana_url"].rstrip("/")
     space = customer.get("space", "default")
@@ -36,7 +69,7 @@ def import_url(customer):
     return f"{base}{prefix}/api/detection_engine/rules/_import"
 
 
-def deploy(customer, rules, dry_run):
+def deploy(customer, rules, dry_run, kv_client=None):
     rendered = render_for_customer(rules, customer)
     ndjson = to_ndjson(rendered)
     label = f"{customer['id']} (ring {customer['ring']})"
@@ -45,9 +78,10 @@ def deploy(customer, rules, dry_run):
         print(f"  DRY RUN {label}: would import {len(rendered)} rule(s) to {import_url(customer)}")
         return True
 
-    api_key = os.environ.get(customer["api_key_env"])
-    if not api_key:
-        print(f"  FAIL    {label}: env var {customer['api_key_env']} is not set")
+    try:
+        api_key = key_from_keyvault(customer, kv_client) if kv_client else key_from_env(customer)
+    except Exception as exc:  # noqa: BLE001 - any credential failure is a tenant failure
+        print(f"  FAIL    {label}: could not read API key: {exc}")
         return False
 
     response = requests.post(
@@ -81,7 +115,17 @@ def main():
     parser.add_argument("--ring", type=int, help="only deploy to tenants in this ring")
     parser.add_argument("--customer", help="only deploy to this tenant id")
     parser.add_argument("--dry-run", action="store_true", help="render and report, send nothing")
+    parser.add_argument(
+        "--key-source",
+        choices=["env", "keyvault"],
+        default="env",
+        help="where to read tenant API keys from (default: env)",
+    )
+    parser.add_argument("--key-vault-url", help="https://<vault>.vault.azure.net/, required for --key-source keyvault")
     args = parser.parse_args()
+
+    if args.key_source == "keyvault" and not args.dry_run and not args.key_vault_url:
+        parser.error("--key-vault-url is required when --key-source is keyvault")
 
     rules = load_rules()
     targets = load_customers()
@@ -94,8 +138,12 @@ def main():
         print("no tenants matched the given filters")
         return 1
 
+    kv_client = None
+    if args.key_source == "keyvault" and not args.dry_run:
+        kv_client = make_keyvault_client(args.key_vault_url)
+
     print(f"Deploying {len(rules)} rule(s) to {len(targets)} tenant(s)")
-    results = [deploy(c, rules, args.dry_run) for c in targets]
+    results = [deploy(c, rules, args.dry_run, kv_client) for c in targets]
 
     failed = results.count(False)
     print(f"\n{results.count(True)} succeeded, {failed} failed")
