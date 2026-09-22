@@ -1,0 +1,33 @@
+{
+  "rule_id": "9d2a7c14-3e55-4b88-a0d1-77e6c9f4b210",
+  "name": "AWS Root Account Console Login",
+  "description": "Detects an interactive console sign-in using the AWS root account, which should never be used for day-to-day operations.",
+  "type": "query",
+  "language": "kuery",
+  "query": "event.dataset:aws.cloudtrail and event.action:ConsoleLogin and aws.cloudtrail.user_identity.type:Root",
+  "index": ["logs-aws.cloudtrail-*"],
+  "severity": "high",
+  "risk_score": 73,
+  "interval": "10m",
+  "from": "now-15m",
+  "enabled": true,
+  "version": 1,
+  "tags": ["managed-by:soc-cicd", "tactic:initial-access", "platform:aws"],
+  "threat": [
+    {
+      "framework": "MITRE ATT&CK",
+      "tactic": {
+        "id": "TA0001",
+        "name": "Initial Access",
+        "reference": "https://attack.mitre.org/tactics/TA0001/"
+      },
+      "technique": [
+        {
+          "id": "T1078",
+          "name": "Valid Accounts",
+          "reference": "https://attack.mitre.org/techniques/T1078/"
+        }
+      ]
+    }
+  ]
+}

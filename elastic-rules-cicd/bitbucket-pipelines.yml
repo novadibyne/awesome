@@ -1,0 +1,59 @@
+# Bitbucket Pipelines - Elastic detection rules CI/CD
+#
+# PR            -> validate only (no secrets, no network)
+# merge to main -> validate, auto-deploy ring 0, manual gate to ring 1 then ring 2
+#
+# Tenant API keys are Deployment variables in Repository settings ->
+# Deployments, one environment per ring. Mark every key as Secured.
+
+image: python:3.12-slim
+
+definitions:
+  caches:
+    pipcache: ~/.cache/pip
+  steps:
+    - step: &validate
+        name: Validate rules
+        caches:
+          - pipcache
+        script:
+          - pip install -r requirements.txt
+          - python scripts/validate.py
+
+pipelines:
+  pull-requests:
+    '**':
+      - step: *validate
+
+  branches:
+    main:
+      - step: *validate
+
+      - step:
+          name: Deploy ring 0 (internal canary)
+          deployment: ring-0
+          caches:
+            - pipcache
+          script:
+            - pip install -r requirements.txt
+            - python scripts/deploy.py --ring 0
+
+      - step:
+          name: Deploy ring 1 (pilot customers)
+          deployment: ring-1
+          trigger: manual
+          caches:
+            - pipcache
+          script:
+            - pip install -r requirements.txt
+            - python scripts/deploy.py --ring 1
+
+      - step:
+          name: Deploy ring 2 (all remaining customers)
+          deployment: ring-2
+          trigger: manual
+          caches:
+            - pipcache
+          script:
+            - pip install -r requirements.txt
+            - python scripts/deploy.py --ring 2

@@ -1,0 +1,33 @@
+{
+  "rule_id": "4f8b1c2e-6a13-4f0e-9c77-2b8d5a1e0f31",
+  "name": "Encoded PowerShell Command",
+  "description": "Detects powershell.exe launched with an encoded command argument, a common technique for obfuscating payloads.",
+  "type": "query",
+  "language": "kuery",
+  "query": "process.name:\"powershell.exe\" and process.args:(\"-enc\" or \"-EncodedCommand\" or \"-e\")",
+  "index": ["logs-windows.*", "winlogbeat-*"],
+  "severity": "medium",
+  "risk_score": 47,
+  "interval": "5m",
+  "from": "now-9m",
+  "enabled": true,
+  "version": 1,
+  "tags": ["managed-by:soc-cicd", "tactic:defense-evasion", "platform:windows"],
+  "threat": [
+    {
+      "framework": "MITRE ATT&CK",
+      "tactic": {
+        "id": "TA0005",
+        "name": "Defense Evasion",
+        "reference": "https://attack.mitre.org/tactics/TA0005/"
+      },
+      "technique": [
+        {
+          "id": "T1027",
+          "name": "Obfuscated Files or Information",
+          "reference": "https://attack.mitre.org/techniques/T1027/"
+        }
+      ]
+    }
+  ]
+}
