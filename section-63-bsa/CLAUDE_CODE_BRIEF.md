@@ -3,7 +3,7 @@
 > **How to use this file:** put it in an empty project folder, open Claude Code there and say:
 > *"Read CLAUDE_CODE_BRIEF.md and build Phase 1 exactly as specified. Use the statutory text in Section 2.3 word for word. Ask me before deviating from it."*
 
-Proof-of-concept web app: users upload electronic evidence, the app extracts technical metadata, computes hashes, and drafts the certificate in the format prescribed by the **Schedule to Section 63(4)(c) of the Bharatiya Sakshya Adhiniyam, 2023 (BSA, Act 47 of 2023)**.
+Proof-of-concept web app: users add electronic evidence, the app extracts technical metadata, computes hashes, and drafts the certificate in the format prescribed by the **Schedule to Section 63(4)(c) of the Bharatiya Sakshya Adhiniyam, 2023 (BSA, Act 47 of 2023)**.
 
 > ⚠️ **Verify before production:** the statutory wording in Section 2 is reproduced from the BSA bare Act. Check punctuation and layout against the official India Code PDF (link in Sources) before going live. If the official text and any website differ, **the official text wins.**
 
@@ -15,15 +15,16 @@ Proof-of-concept web app: users upload electronic evidence, the app extracts tec
 |---|---|---|---|
 | 1 | An interface to upload pictures, recordings, WhatsApp messages and other evidence. | Next.js (App Router) + TypeScript + Tailwind CSS + shadcn/ui, with a drag-and-drop uploader. | A responsive web app that accepts images, audio, video, PDFs/documents, WhatsApp chat exports (`.txt` or `.zip` with media) and any other file as generic evidence. |
 | 2 | Generate certificates under Section 63 BSA. | Generate a PDF that reproduces the **Schedule word for word**: Part A (Party) and Part B (Expert), plus the hash report annexure the Schedule asks for. | A certificate wizard that pre-fills the technical fields (hashes, file details, device metadata) and outputs a **draft** PDF in the exact Schedule format. Signature boxes stay blank so the people concerned can sign. |
-| 3 | *(implied by the certificate)* Hash values. | SHA-256 as the default. Also compute MD5 and SHA-1 because the Schedule lists all three. Hash on the server, not only in the browser. | Compute and store SHA-256 (plus MD5 and SHA-1) for every file. Generate the hash report annexure. Flag any mismatch between the browser hash and the server hash. |
-| 4 | Track user logs. | Supabase PostgreSQL with an append-only `audit_events` table, hash-chained so tampering can be detected. | Log logins, uploads, hash computation, edits, certificate generation and downloads, with IST timestamp, IP, user agent and document version. |
-| 5 | Possibly a login page. | Supabase Auth (email + password) with Row Level Security. | Registration, login and a dashboard. Each user sees only their own evidence. |
+| 3 | *(implied by the certificate)* Hash values. | SHA-256 as the default. Also compute MD5 and SHA-1 because the Schedule lists all three. In the MVP, hash in the browser so files are never uploaded. | Compute and store SHA-256, SHA-1 and MD5 for every file, in the browser. Generate the hash report annexure. Let the user re-verify a file later and compare with an acquisition hash they type in. |
+| 4 | Track user logs. | **MVP:** an append-only, hash-chained audit log stored in the browser (IndexedDB) that can be exported. **Phase 2:** a server-side log in Supabase. | Log evidence creation, file hashing, re-verification, edits, certificate generation and finalising, downloads and bundle export/import, with IST timestamp and user agent. Include a "Verify chain" check. |
+| 5 | Possibly a login page. **Update: leave it out of the MVP and add it later.** | No login in Phase 1. Add Supabase Auth (email + password) with Row Level Security in Phase 2. | **No login in the MVP.** The app works straight away in the browser, and data stays on the user's device. The data model is ready for user accounts and cloud sync in Phase 2 (Appendix A). |
 | 6 | Possibly payment per certificate. | Design for Razorpay later. Not part of the MVP. | Payments are an optional future module. Leave room in the data model, but write no payment code in Phase 1. |
-| 7 | Build a proof of concept first. | One Next.js app plus Supabase. No microservices. | A working local MVP: upload → hash → metadata → certificate draft → history. |
+| 7 | Build a proof of concept first. | A **static, browser-only** Next.js app with no backend: no Supabase and no microservices in Phase 1. | A working MVP: add files → hash → metadata → certificate draft → history, all in the browser, with export and import of a case bundle as a backup. |
 | 8 | Possibly commercialise later. | Keep evidence processing, legal templates and billing in separate modules. | Modular code (`lib/evidence`, `lib/legal`, `lib/billing`) so it can grow into a SaaS. |
 | 9 | — *(added in my suggestion)* | Build around an **Evidence** record, not a Certificate record. | `Evidence` is the central entity. Files, devices, hash reports, certificate versions and audit events all belong to it. |
 | 10 | — *(added in my suggestion)* | The app **drafts**. It cannot certify. | Clear disclaimers. The Section 63(2) declarations are made by the party, and Part B is signed by an expert. The app only pre-fills technical facts and stamps the PDF "DRAFT". |
 | 11 | — *(added in my suggestion)* | Section 63(4) requires a certificate "at each instance" the record is submitted. | Certificates are versioned for each submission, with court and case number recorded. |
+| 12 | Host it on GitHub Pages or AWS. | GitHub Pages for the MVP (free, auto-deploys). AWS Amplify when you need AWS or Phase 2 server features. S3 + CloudFront for the lowest cost. | Build as a static export (`output: 'export'`) that runs on any of the three. Include the GitHub Pages deploy workflow. Step-by-step instructions are in Section 4. |
 
 ---
 
@@ -166,31 +167,397 @@ Place:
 
 ---
 
-## 3. Claude Code build specification (Phase 1 MVP)
+## 3. Claude Code build specification (Phase 1 MVP: no login, runs in the browser)
 
 ### 3.1 Goal
-Build a local, working MVP. A logged-in user creates an **Evidence** record, uploads one or more files, the app hashes them and extracts metadata, the user fills device and declarant details, and the app generates a **draft Section 63 certificate PDF (Part A + Part B + Hash Report annexure)**. Every action is audit-logged.
+Build a **static, browser-only** MVP. There is **no login and no backend**. Hashing, metadata extraction and PDF generation all run in the user's browser, and **evidence files are never uploaded anywhere**. Data is kept in the browser's IndexedDB, and the user can export and import a "case bundle" as a backup. The build output is plain static files that can be hosted on **GitHub Pages** or **AWS** (see Section 4).
 
-### 3.2 Non-negotiable legal rules
+The user flow:
+1. Create an **Evidence** record.
+2. Add files. The app hashes them and extracts metadata.
+3. Fill in device and declarant details.
+4. Generate a **draft Section 63 certificate PDF** (Part A + Part B + Hash Report annexure).
+
+Every action is written to a local, hash-chained audit log.
+
+Why browser-only for the MVP:
+- No login is needed.
+- Sensitive evidence never leaves the user's device.
+- There's no server cost.
+- GitHub Pages can host it.
+- Phase 2 can add login and cloud storage (Appendix A) without rewriting the front end.
+
+### 3.2 Non-negotiable rules
 1. Reproduce the Schedule text from Section 2.3 **exactly**. Store it in one file (`lib/legal/schedule-63.ts`) and never generate it with an LLM or paraphrase it.
 2. The app never states or implies that it has certified anything. Every PDF page carries the footer: *"Draft prepared with [AppName] on DD/MM/YYYY HH:MM IST. Not valid until verified and signed by the declarant (Part A) and the expert (Part B)."*
 3. Signature areas are left **blank**. No auto-signatures or typed-name signatures.
 4. The 63(2) declaration in Part A cannot be edited. The user must tick: *"I have read and understood this declaration and it is true to the best of my knowledge and belief."*
 5. Dates are printed as `DD/MM/YYYY`. Times are printed as `HH:MM` in 24-hour IST (`Asia/Kolkata`).
 6. Every certificate is a new immutable **version**. Finalising locks the version and stores the PDF's own SHA-256.
+7. **No file content leaves the browser.** No analytics or error-reporting SDK may receive file data. Add a Content-Security-Policy `<meta>` tag with `connect-src 'self'` so the browser itself blocks uploads. Show this notice on the home page: *"Your files are processed only in this browser and are never uploaded."*
 
 ### 3.3 Tech stack
-- **Framework:** Next.js 15 (App Router), TypeScript `strict`, React Server Components where sensible
+- **Framework:** Next.js 15 (App Router) with **`output: 'export'`** (static site), TypeScript `strict`. Static export has these limits, and the app must follow all of them:
+  - no API routes, server actions or middleware;
+  - **no dynamic route segments**: use query strings such as `/evidence/?id=…` and read them with `useSearchParams` inside `<Suspense>`;
+  - `images: { unoptimized: true }`;
+  - `trailingSlash: true`;
+  - `basePath` read from `NEXT_PUBLIC_BASE_PATH`.
 - **UI:** Tailwind CSS, shadcn/ui, lucide-react, react-hook-form + zod
-- **Backend:** Supabase (Auth, Postgres, Storage), `@supabase/ssr`
-- **Hashing:** Node `crypto` (streaming `createHash`) on the server. `hash-wasm` in the browser for the on-upload preview.
-- **File detection:** `file-type` (magic bytes, not the file extension)
-- **Metadata:** `exifr` (images), `music-metadata` (audio/video container tags, duration), `pdf-lib` (PDF info), `jszip` (WhatsApp `.zip` exports)
-- **PDF:** `@react-pdf/renderer`, server-side
+- **Local database:** IndexedDB via `dexie` + `dexie-react-hooks`
+- **Hashing:** `hash-wasm` (`createSHA256`, `createSHA1`, `createMD5`). Read the file in 4 MB chunks (`file.slice().arrayBuffer()`) and compute all three hashes in **one pass** inside a **Web Worker** with a progress bar. Don't use `crypto.subtle`, because it can't do MD5 and loads the whole file into memory.
+- **File detection:** `file-type` (`fileTypeFromBlob`, which reads magic bytes rather than the file extension)
+- **Metadata:** `exifr` (images), `music-metadata` (`parseBlob` for audio and video containers), `pdf-lib` (PDF info), `jszip` (WhatsApp `.zip` exports and case bundles)
+- **PDF:** `@react-pdf/renderer` in the browser (`pdf(<CertificateDocument/>).toBlob()`), lazy-loaded
 - **Dates:** `date-fns` + `date-fns-tz` (`Asia/Kolkata`)
-- **Tests:** Vitest for `lib/`, Playwright for one end-to-end happy path
+- **Tests:** Vitest for `lib/`. Playwright runs one end-to-end happy path against the static build (`next build && npx serve out`).
 
-### 3.4 Data model (Supabase SQL migrations)
+### 3.4 Local data model (Dexie / IndexedDB)
+Field names match the Phase 2 SQL in Appendix A, so data can later be synced to the cloud unchanged.
+
+```ts
+// lib/db.ts
+db.version(1).stores({
+  evidence:     'id, status, createdAt, updatedAt',
+  files:        'id, evidenceId, sha256',
+  blobs:        'fileId',                       // the File/Blob itself (optional copy)
+  devices:      'id, evidenceId',
+  certificates: 'id, evidenceId, [evidenceId+version], status',
+  auditEvents:  '++seq, evidenceId, certificateId, action, createdAt',
+  settings:     'key',                          // default declarant/expert profile, app prefs
+});
+
+type EvidenceType   = 'image'|'audio'|'video'|'document'|'whatsapp_export'|'email'|'other';
+type DeviceCategory = 'computer_storage_media'|'dvr'|'mobile'|'flash_drive'|'cd_dvd'|'server'|'cloud'|'other';
+type ControlType    = 'owned'|'maintained'|'managed'|'operated';
+type IdentifierType = 'imei'|'uin'|'uid'|'mac'|'cloud_id'|'other';
+type HashAlgo       = 'sha256'|'sha1'|'md5'|'other';
+
+interface Evidence { id: string; title: string; description?: string; evidenceType: EvidenceType;
+  mannerOfProduction?: string /* s.63(4)(a) */; acquiredAt?: string;
+  status: 'draft'|'hashed'|'certificate_drafted'|'finalised'|'archived'; createdAt: string; updatedAt: string; }
+
+interface EvidenceFile { id: string; evidenceId: string; originalFilename: string; declaredMime?: string; detectedMime?: string;
+  sizeBytes: number; lastModified?: string; sha256: string; sha1: string; md5: string; hashedAt: string;
+  acquisitionHash?: string; acquisitionHashAlgo?: HashAlgo; acquisitionHashMatch?: boolean;
+  metadata: Record<string, unknown>; blobStored: boolean; }
+
+interface Device { id: string; evidenceId: string; categories: DeviceCategory[]; categoryOther?: string;
+  makeModel?: string; color?: string; serialNumber?: string; otherInfo?: string; control: ControlType[];
+  identifiers: { idType: IdentifierType; value: string }[]; }
+
+interface Certificate { id: string; evidenceId: string; version: number; scheduleVersion: 'BSA-2023-original';
+  courtName?: string; caseNumber?: string; partA: PartA; partB: PartB; hashAlgo: HashAlgo;
+  declarationAcknowledgedAt?: string; status: 'draft'|'finalised'; pdfSha256?: string; createdAt: string; }
+
+interface AuditEvent { seq?: number; action: string; evidenceId?: string; certificateId?: string;
+  details: Record<string, unknown>; userAgent: string; createdAt: string; prevHash: string; rowHash: string; }
+```
+
+**Audit log rules**
+- Only `lib/audit/append.ts` may write to `auditEvents`. Don't export any update or delete function.
+- Each row stores `rowHash = sha256(prevHash + canonicalJSON(row))`. The Audit screen has a "Verify chain" button.
+- Actions to log:
+  - `evidence.create`, `evidence.update`
+  - `file.add`, `file.hash`, `file.reverify`
+  - `certificate.generate`, `certificate.finalise`, `certificate.download`
+  - `bundle.export`, `bundle.import`
+- Show this limitation in the UI and the README: a browser-local log detects edits, but the user can delete it by clearing site data. A server-side log comes in Phase 2.
+
+### 3.5 File handling and hashing flow
+1. The user drops files, or picks them with the file picker. Nothing is uploaded.
+2. A Web Worker computes **SHA-256, SHA-1 and MD5 in one pass** and shows progress. The results are saved to `files` and logged as `file.hash`.
+3. Detect the real MIME type with `file-type` and extract metadata (3.6).
+4. The option *"Keep a copy of the file in this browser"* is on by default:
+   - The file is stored in `blobs`.
+   - Call `navigator.storage.persist()`.
+   - Show the space used and left with `navigator.storage.estimate()`.
+   - Warn when the file is close to the browser's storage quota.
+   - If the user turns the option off, only the hashes and metadata are kept, and the user must keep the original file.
+5. **Re-verify:** the user re-selects the original, or the app uses the stored copy. The app re-hashes it, compares the result with the stored SHA-256 and logs `file.reverify` with match or mismatch.
+6. Acquisition hash: the user can type in a hash the expert or party computed when the evidence was collected. The app compares it with the computed hash (see 2.4).
+7. Hashing streams in chunks, so files of several GB work.
+
+### 3.6 Metadata extraction by type
+| Type | Extract | Suggested device category |
+|---|---|---|
+| Image | EXIF Make, Model, DateTimeOriginal, GPS (if present), software, dimensions. Note that screenshots often have no EXIF. | Mobile / Computer |
+| Audio | duration, codec, bitrate, sample rate, container tags, creation date | Mobile |
+| Video | duration, container, codec, resolution, creation date (via `music-metadata`) | Mobile / DVR (CCTV) |
+| PDF / document | page count, author, producer, creation and modification dates | Computer / Storage Media |
+| WhatsApp export (`.txt` or `.zip`) | Parse Android `DD/MM/YY, HH:MM - Name: msg` and iOS `[DD/MM/YY, HH:MM:SS] Name: msg`. Extract participants, first and last message date, message count and media files. **Hash the zip and every file inside it.** | Mobile + Cloud |
+| Other | size, detected MIME, last-modified time | Other |
+
+### 3.7 Certificate generation
+- Wizard steps:
+  1. Evidence and files: review hashes, `mannerOfProduction`, court and case number.
+  2. Device(s).
+  3. **Part A**: party details (pre-filled from Settings → My details), control type, declaration acknowledgement.
+  4. **Part B**: expert name, relation, address/employer, designation, qualification note.
+  5. Date, time and place.
+  6. Preview.
+  7. Generate.
+- Output, A4, one PDF, generated in the browser and downloaded:
+  - Part A on page 1 onward.
+  - Part B on a new page.
+  - **Annexure: Hash Report.** One row per file with: filename, size in bytes, detected MIME, SHA-256, SHA-1, MD5, acquisition hash and match status, time computed (IST), tool (`hash-wasm <version> in <browser>`), evidence ID and file ID.
+- Print hash values in a monospace font with wrapping, and never truncate them.
+- **Tick boxes:** draw each one as a small bordered square, with a tick for selected options. Don't use the ☐/☑ characters, because react-pdf's built-in fonts can't display them. If you use them anyway, bundle a font that includes them, such as Noto Sans Symbols 2, in `public/fonts`.
+- Show a `DRAFT` watermark until the user finalises the version. On finalise, compute and store `pdfSha256` and log it.
+
+### 3.8 Screens and routes (static export: query strings, not `[id]` folders)
+| Route | Screen | Key components |
+|---|---|---|
+| `/` | Dashboard | evidence list, certificate drafts, recent activity, counts, privacy notice |
+| `/evidence/new/` | New Evidence | title, type, `mannerOfProduction`, drag-and-drop, per-file hash progress, detected type, metadata panel |
+| `/evidence/?id=…` | Evidence Detail | files with hashes, re-verify, devices, certificate versions, audit timeline |
+| `/certificate/?evidenceId=…` | Certificate Wizard | the steps in 3.7, a statute help panel (s.63 text), PDF preview |
+| `/audit/` | Audit Log | filterable events, "Verify chain", export as JSON |
+| `/settings/` | My Details & Backup | default declarant and expert profile, **Export case bundle**, **Import case bundle**, storage usage, clear data |
+
+### 3.9 Case bundle (backup / move to another computer)
+- `.zip` containing:
+  - `manifest.json`: all records for the selected evidence;
+  - `files/<fileId>/<originalFilename>` (when the copy is stored);
+  - `certificates/<id>-v<version>.pdf`;
+  - `audit.json`;
+  - `SHA256SUMS.txt`: one line per file in the bundle.
+- On import, verify every file against `SHA256SUMS.txt` and the stored hashes before saving anything. Log `bundle.import` with the result.
+
+### 3.10 Folder structure
+```
+app/page.tsx                      (dashboard)
+app/evidence/new/page.tsx
+app/evidence/page.tsx             (detail, reads ?id=)
+app/certificate/page.tsx          (wizard, reads ?evidenceId=)
+app/audit/page.tsx
+app/settings/page.tsx
+lib/db.ts
+lib/evidence/   hash.worker.ts, hashing.ts, detect.ts, metadata/{image,audio,video,pdf,whatsapp}.ts
+lib/legal/      schedule-63.ts, section-63.ts, validators.ts (IMEI Luhn, MAC)
+lib/pdf/        CertificateDocument.tsx, HashReport.tsx, Checkbox.tsx
+lib/audit/      append.ts, verify.ts
+lib/bundle/     export.ts, import.ts
+lib/billing/    (empty placeholder, Phase 2)
+.github/workflows/deploy-pages.yml
+```
+
+### 3.11 Phase 1 acceptance criteria
+- [ ] `npm run build` produces a static `out/` folder. The app works when served from a sub-path (`NEXT_PUBLIC_BASE_PATH=/repo-name`).
+- [ ] The browser DevTools Network tab shows **no request carrying file content** while hashing, generating or exporting.
+- [ ] Image, audio, video, PDF and WhatsApp `.zip` files all work. The real MIME type is detected.
+- [ ] SHA-256, SHA-1 and MD5 match `sha256sum`, `sha1sum` and `md5sum` for the test fixtures (Vitest).
+- [ ] Device and identifier fields work. IMEI is validated with the Luhn check.
+- [ ] The PDF contains Part A, Part B and the Hash Report, with Schedule wording matching Section 2.3 exactly (unit test compares it with the constants). Tick boxes render correctly.
+- [ ] Dates appear as `DD/MM/YYYY` and times as `HH:MM` IST in 24-hour format.
+- [ ] Every action in 3.4 creates an audit event, and "Verify chain" passes. Editing a row in DevTools makes it fail.
+- [ ] Finalised certificate versions are read-only, and their `pdfSha256` is stored.
+- [ ] Exporting a case bundle, clearing site data and importing it again restores everything, and all hashes verify.
+- [ ] Deploys to GitHub Pages through the workflow in 4.1.
+
+### 3.12 Later phases (design for these, don't build them)
+- **Phase 2, login and cloud:**
+  - Supabase Auth (email + password).
+  - Cloud storage of evidence, using the Appendix A schema with RLS.
+  - Server-side hash re-verification with a Supabase Edge Function.
+  - Server-side audit log.
+  - Sync of local IndexedDB data to the cloud account.
+- **Phase 2:**
+  - An expert account role that receives Part B requests.
+  - Razorpay payment per certificate (`lib/billing`).
+- **Phase 3:**
+  - Aadhaar eSign or DSC signing.
+  - `ffprobe` video analysis and `.eml` email parsing.
+  - Hindi certificate rendering.
+  - DPDP Act 2023 consent and notice, and a data-retention policy. These are needed as soon as evidence is stored on a server.
+
+### 3.13 Environment variables (Phase 1)
+```
+NEXT_PUBLIC_BASE_PATH=            # "" for a custom domain or AWS root; "/<repo-name>" for GitHub Pages project sites
+NEXT_PUBLIC_APP_NAME="Section 63 Draft Certificate Tool"
+```
+
+---
+
+## 4. Hosting
+
+**Recommendation:** use **GitHub Pages** for the MVP. It's free, deploys on every push and takes the least setup. Move to **AWS Amplify** when Phase 2 needs a server or you want a custom domain hosted in India. **S3 + CloudFront** is the cheapest AWS option, but it takes the most steps.
+
+All three serve the same `out/` folder. In Phase 1 no evidence is stored on the host, so the hosting region doesn't matter for evidence yet.
+
+### 4.0 Shared setup (needed for every option)
+1. Create a **new** GitHub repository, e.g. `bsa63-certificate`. Don't build it inside the `awesome` fork.
+2. `next.config.ts`:
+   ```ts
+   import type { NextConfig } from 'next';
+   const nextConfig: NextConfig = {
+     output: 'export',
+     basePath: process.env.NEXT_PUBLIC_BASE_PATH || '',
+     trailingSlash: true,
+     images: { unoptimized: true },
+   };
+   export default nextConfig;
+   ```
+3. `package.json` scripts: `"build": "next build"`, `"test": "vitest run"`.
+4. Check locally: run `npm run build`, then `npx serve out` and open the printed URL.
+
+### 4.1 GitHub Pages (recommended for the MVP)
+1. Push the project to `main` in the new repo. On a **free** GitHub plan, the repo must be **public** to use Pages; private repos need GitHub Pro or a Team plan. A public repo is fine here because only the source code is public, and evidence never leaves the user's browser.
+2. In the repo, go to **Settings → Pages → Build and deployment → Source** and choose **GitHub Actions**.
+3. Add `.github/workflows/deploy-pages.yml`:
+   ```yaml
+   name: Deploy to GitHub Pages
+   on:
+     push:
+       branches: [main]
+     workflow_dispatch:
+   permissions:
+     contents: read
+     pages: write
+     id-token: write
+   concurrency:
+     group: pages
+     cancel-in-progress: false
+   jobs:
+     build:
+       runs-on: ubuntu-latest
+       steps:
+         - uses: actions/checkout@v5
+         - uses: actions/setup-node@v5
+           with:
+             node-version: 22
+             cache: npm
+         - run: npm ci
+         - run: npm run test --if-present
+         - run: npm run build
+           env:
+             NEXT_PUBLIC_BASE_PATH: /${{ github.event.repository.name }}
+         - uses: actions/upload-pages-artifact@v4
+           with:
+             path: out
+     deploy:
+       needs: build
+       runs-on: ubuntu-latest
+       environment:
+         name: github-pages
+         url: ${{ steps.deployment.outputs.page_url }}
+       steps:
+         - id: deployment
+           uses: actions/deploy-pages@v4
+   ```
+4. Commit and push. Watch the run in the **Actions** tab. The site goes live at `https://<your-username>.github.io/bsa63-certificate/`.
+5. **Custom domain (optional):**
+   1. Go to **Settings → Pages → Custom domain** and enter e.g. `certify.example.in`.
+   2. At your DNS provider, add a `CNAME` record: `certify` → `<your-username>.github.io`.
+   3. Tick **Enforce HTTPS**.
+   4. In the workflow, change `NEXT_PUBLIC_BASE_PATH` to an empty string, because the site now lives at the domain root.
+6. GitHub Pages can't set custom HTTP headers, so the Content-Security-Policy goes in a `<meta>` tag in `app/layout.tsx` (rule 7 in 3.2). Start from this and loosen only what a library actually needs:
+   `default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; worker-src 'self' blob:; frame-src blob:; object-src 'none'; base-uri 'self'; form-action 'none'`
+
+### 4.2 AWS Amplify Hosting (easiest AWS option, and it also supports Phase 2 server features)
+1. In the AWS Console, open **AWS Amplify → Create new app → GitHub**. Authorize access and pick the `bsa63-certificate` repo and the `main` branch. Region: **Asia Pacific (Mumbai) ap-south-1**.
+2. Replace the build settings with this `amplify.yml`. It deploys the static `out/` folder:
+   ```yaml
+   version: 1
+   frontend:
+     phases:
+       preBuild:
+         commands:
+           - npm ci
+       build:
+         commands:
+           - npm run build
+     artifacts:
+       baseDirectory: out
+       files:
+         - '**/*'
+     cache:
+       paths:
+         - node_modules/**/*
+   ```
+   Leave `NEXT_PUBLIC_BASE_PATH` unset, because Amplify serves the site at the root.
+3. Click **Save and deploy**. You get a URL like `https://main.<app-id>.amplifyapp.com`, and every push to `main` redeploys.
+4. **Custom domain:** go to **Hosting → Custom domains → Add domain**. Use your Route 53 domain, or follow the DNS records Amplify shows for an external registrar. Amplify issues the HTTPS certificate automatically.
+5. **Headers:** Amplify can set real HTTP headers (**Hosting → Custom headers**). Move the CSP there as a `Content-Security-Policy` header.
+
+### 4.3 AWS S3 + CloudFront (cheapest, most control)
+1. **S3:** create a bucket, e.g. `bsa63-certificate-site`, in `ap-south-1`. Keep **Block all public access ON**.
+2. **CloudFront:** go to **Create distribution**.
+   - **Origin:** the S3 bucket.
+   - **Origin access:** **Origin access control** (create a new one). When CloudFront offers the bucket policy, copy it into **S3 → bucket → Permissions → Bucket policy**.
+   - **Viewer protocol policy:** Redirect HTTP to HTTPS.
+   - **Default root object:** `index.html`.
+3. **CloudFront Function** (viewer request). Without it, S3 won't serve `index.html` for paths like `/audit/`. Create the function and attach it to the default behaviour:
+   ```js
+   function handler(event) {
+     var request = event.request;
+     if (request.uri.endsWith('/')) {
+       request.uri += 'index.html';
+     } else if (!request.uri.includes('.')) {
+       request.uri += '/index.html';
+     }
+     return request;
+   }
+   ```
+4. **Error pages:** map 403 and 404 to `/404.html` with response code 404.
+5. **Deploy manually** (needs the AWS CLI, configured):
+   ```bash
+   npm run build
+   aws s3 sync out/ s3://bsa63-certificate-site --delete
+   aws cloudfront create-invalidation --distribution-id <DISTRIBUTION_ID> --paths "/*"
+   ```
+6. **Custom domain:**
+   1. Request a certificate in **ACM in `us-east-1`**. CloudFront only accepts certificates from that region. Validate it by DNS.
+   2. Add the domain under **Alternate domain names** in the distribution.
+   3. In Route 53, create an **A/AAAA alias** record pointing to the distribution.
+7. **Security headers:** **CloudFront → Policies → Response headers** lets you attach the CSP and HSTS as real headers.
+8. **Deploy automatically from GitHub** (no stored AWS keys; uses OIDC):
+   1. In IAM, add the identity provider `token.actions.githubusercontent.com` (audience `sts.amazonaws.com`).
+   2. Create a role whose trust policy only allows `repo:<your-username>/bsa63-certificate:ref:refs/heads/main`. Give it these permissions:
+      - `s3:ListBucket` on the bucket;
+      - `s3:PutObject` and `s3:DeleteObject` on `bucket/*`;
+      - `cloudfront:CreateInvalidation` on the distribution.
+   3. Add `.github/workflows/deploy-aws.yml`:
+   ```yaml
+   name: Deploy to AWS
+   on:
+     push:
+       branches: [main]
+   permissions:
+     id-token: write
+     contents: read
+   jobs:
+     deploy:
+       runs-on: ubuntu-latest
+       steps:
+         - uses: actions/checkout@v5
+         - uses: actions/setup-node@v5
+           with:
+             node-version: 22
+             cache: npm
+         - run: npm ci
+         - run: npm run build
+         - uses: aws-actions/configure-aws-credentials@v4
+           with:
+             role-to-assume: arn:aws:iam::<ACCOUNT_ID>:role/<ROLE_NAME>
+             aws-region: ap-south-1
+         - run: aws s3 sync out/ s3://bsa63-certificate-site --delete
+         - run: aws cloudfront create-invalidation --distribution-id ${{ vars.CLOUDFRONT_DISTRIBUTION_ID }} --paths "/*"
+   ```
+   Store the distribution ID as a repository **variable** (**Settings → Secrets and variables → Actions → Variables**).
+
+### 4.4 Which one when
+| Situation | Use |
+|---|---|
+| MVP, free, quickest | GitHub Pages (4.1) |
+| Want AWS, custom domain, real security headers, little setup | Amplify (4.2) |
+| Phase 2 with login: static front end + Supabase | Any of the three. Supabase is called straight from the browser, so the front end can stay static. |
+| Phase 2 needs Next.js server features (API routes, SSR) | Amplify (4.2), with the `output: 'export'` line removed from the config. GitHub Pages and plain S3 can't run server code. |
+| Lowest running cost with full control | S3 + CloudFront (4.3) |
+
+---
+
+## Appendix A: Phase 2 cloud schema (Supabase SQL; not used in Phase 1)
 
 ```sql
 -- enums
@@ -286,92 +653,6 @@ create table audit_events (              -- append-only, hash-chained
 - **RLS:** turn it on for every table. Users can select, insert and update only rows where they own the parent `evidence`.
 - **audit_events:** insert and select only. Add a trigger that raises an error on UPDATE or DELETE. Add a `BEFORE INSERT` trigger that fills in `prev_hash` and `row_hash` (using `pgcrypto`).
 - Once a certificate's `status = 'finalised'`, a trigger blocks any further edits to that row.
-
-### 3.5 Storage, upload and hashing flow
-1. Store files in a private bucket `evidence` at `{user_id}/{evidence_id}/{file_id}/{original_filename}`.
-2. The browser computes SHA-256 with `hash-wasm` while uploading and shows it straight away.
-3. After upload, call `POST /api/files/[id]/hash`. The server streams the object from Storage and computes **SHA-256, SHA-1 and MD5 in one pass**. It stores them, sets `hash_match` and writes an audit event.
-4. Detect the real file type with `file-type` and extract metadata (3.6). Store it in `metadata`.
-5. Downloads use short-lived signed URLs (60 seconds), and every download is audit-logged.
-6. Upload limit: 50 MB per file in Phase 1, configurable through `MAX_UPLOAD_MB`.
-
-### 3.6 Metadata extraction by type
-| Type | Extract | Suggested device category |
-|---|---|---|
-| Image | EXIF Make, Model, DateTimeOriginal, GPS (if present), software, dimensions. Note that screenshots often have no EXIF. | Mobile / Computer |
-| Audio | duration, codec, bitrate, sample rate, container tags, creation date | Mobile |
-| Video | duration, container, codec, resolution, creation date (via `music-metadata`). Full `ffprobe` waits for Phase 2. | Mobile / DVR (CCTV) |
-| PDF / document | page count, author, producer, creation and modification dates | Computer / Storage Media |
-| WhatsApp export (`.txt` or `.zip`) | Parse Android `DD/MM/YY, HH:MM - Name: msg` and iOS `[DD/MM/YY, HH:MM:SS] Name: msg`. Extract participants, first and last message date, message count and media files. **Hash the zip and every file inside it.** | Mobile + Cloud |
-| Other | size, detected MIME | Other |
-
-### 3.7 Certificate generation
-- Wizard steps:
-  1. Evidence and files: review hashes, `manner_of_production`, court and case number.
-  2. Device(s).
-  3. **Part A**: party details, control type, declaration acknowledgement.
-  4. **Part B**: expert name, relation, address/employer, designation, qualification note.
-  5. Date, time and place.
-  6. Preview.
-  7. Generate.
-- Output, A4, one PDF:
-  - Part A on page 1 onward.
-  - Part B on a new page.
-  - **Annexure: Hash Report.** One row per file with: filename, size in bytes, detected MIME, SHA-256, SHA-1, MD5, acquisition hash (if entered) with match status, time computed (IST), tool (`Node.js crypto <version>`), evidence ID and file ID.
-- Print hash values in a monospace font with wrapping, and never truncate them.
-- Tick boxes appear as `☑` or `☐` based on the selections.
-- Show a `DRAFT` watermark until the user finalises the version. When finalised, compute and store `pdf_sha256` and log it.
-
-### 3.8 Screens
-| Screen | Purpose | Key components |
-|---|---|---|
-| Login / Register | Supabase Auth | email + password, reset password |
-| Dashboard | Overview | evidence list, certificate drafts, recent activity, counts |
-| New Evidence / Upload | Create a record and add files | drag-and-drop, per-file progress, live SHA-256, detected type, metadata panel |
-| Evidence Detail | One evidence item | files with hashes, devices, certificate versions, audit timeline |
-| Certificate Wizard | Draft the Schedule certificate | the steps in 3.7, a statute help panel (s.63 text), PDF preview |
-| Evidence History / Audit | Activity trail | filterable `audit_events` table with hash-chain verification status |
-
-### 3.9 Suggested folder structure
-```
-app/(auth)/login, register
-app/(app)/dashboard, evidence/[id], evidence/new, evidence/[id]/certificate/new, audit
-app/api/files/[id]/hash/route.ts
-app/api/certificates/[id]/pdf/route.ts
-lib/evidence/   hashing.ts, detect.ts, metadata/{image,audio,video,pdf,whatsapp}.ts
-lib/legal/      schedule-63.ts, section-63.ts, validators.ts (IMEI Luhn, MAC)
-lib/pdf/        CertificateDocument.tsx, HashReport.tsx
-lib/audit/      log.ts
-lib/billing/    (empty placeholder, Phase 2)
-supabase/migrations/*.sql
-```
-
-### 3.10 Phase 1 acceptance criteria
-- [ ] A user can register, log in and log out. They cannot see another user's evidence (RLS tested).
-- [ ] Image, audio, PDF and WhatsApp `.zip` uploads all work. The real MIME type is detected.
-- [ ] The server computes SHA-256, SHA-1 and MD5. The browser and server SHA-256 match for an unchanged file.
-- [ ] Device and identifier fields work. IMEI is validated with the Luhn check.
-- [ ] The generated PDF contains Part A, Part B and the Hash Report, with Schedule wording matching Section 2.3 exactly (unit test compares it with the constants).
-- [ ] Dates appear as `DD/MM/YYYY` and times as `HH:MM` IST in 24-hour format.
-- [ ] Every action listed in 3.4 creates an audit event. UPDATE and DELETE on `audit_events` fail. The hash-chain verifier passes.
-- [ ] Finalised certificate versions are read-only, and their `pdf_sha256` is stored.
-
-### 3.11 Out of scope for Phase 1 (design for it, don't build it)
-- Razorpay payment per certificate (`lib/billing`)
-- An expert account role that receives Part B requests and fills them in their own login
-- Aadhaar eSign or DSC digital signing of the PDF
-- `ffprobe` video analysis, `.eml` email parsing, CCTV/DVR export guidance
-- Multi-language (Hindi) certificate rendering
-- Data-retention policy and DPDP Act 2023 consent and notice flows (needed before any commercial launch)
-
-### 3.12 Environment variables
-```
-NEXT_PUBLIC_SUPABASE_URL=
-NEXT_PUBLIC_SUPABASE_ANON_KEY=
-SUPABASE_SERVICE_ROLE_KEY=
-MAX_UPLOAD_MB=50
-APP_NAME="Section 63 Draft Certificate Tool"
-```
 
 ---
 
