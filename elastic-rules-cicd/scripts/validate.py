@@ -1,26 +1,21 @@
 #!/usr/bin/env python3
-"""Validate every rule and every tenant overlay. Runs on pull requests.
+"""Validate every rule and every replication target. Runs on pull requests.
 
 Needs no credentials and touches no Elastic stack, so it is safe to run in
-any CI, on any branch, from a fork.
+any CI, on any branch.
 """
 
 import sys
 
-from common import OWNERSHIP_TAG, REQUIRED_FIELDS, load_customers, load_rules, render_for_customer
+from common import OWNERSHIP_TAG, REQUIRED_FIELDS, load_rules, load_targets, render_for_target
 
 VALID_SEVERITIES = {"low", "medium", "high", "critical"}
 
 
-def main():
+def validate_rules(rules):
     errors = []
-    rules = load_rules()
-
-    if not rules:
-        print("no rules found in rules/")
-        return 1
-
     seen_ids = {}
+
     for path, rule in rules:
         name = path.name
 
@@ -44,21 +39,57 @@ def main():
         if OWNERSHIP_TAG not in rule.get("tags", []):
             errors.append(f"{name}: must carry the '{OWNERSHIP_TAG}' tag so drift cleanup can find it")
 
-        index = rule.get("index") or []
-        if any(pattern.strip() in ("*", "*:*") for pattern in index):
+        if any(p.strip() in ("*", "*:*") for p in rule.get("index") or []):
             errors.append(f"{name}: index pattern '*' is too broad")
 
         if not isinstance(rule.get("version"), int):
             errors.append(f"{name}: version must be an int, and must be bumped on every change")
 
-    # Every tenant overlay must still produce a usable rule set.
-    for customer in load_customers():
-        rendered = render_for_customer(rules, customer)
-        if not rendered:
-            errors.append(f"customer '{customer['id']}': overlay excludes every rule")
-        for key in ("id", "ring", "kibana_url", "space", "api_key_env"):
-            if key not in customer:
-                errors.append(f"customer '{customer.get('id', '?')}': missing '{key}'")
+    return errors
+
+
+def validate_targets(rules, targets):
+    errors = []
+    seen = set()
+
+    if not targets:
+        errors.append("deployments.yml expands to no targets")
+
+    for target in targets:
+        label = target["id"]
+
+        if label in seen:
+            errors.append(f"target '{label}': duplicate deployment/space pair")
+        seen.add(label)
+
+        if not target["kibana_url"].startswith("https://"):
+            errors.append(f"target '{label}': kibana_url must be https")
+        if not target.get("api_key_env") and not target.get("key_vault_secret"):
+            errors.append(f"target '{label}': needs api_key_env or key_vault_secret on its deployment")
+        if target.get("key_vault_secret") and "_" in target["key_vault_secret"]:
+            errors.append(
+                f"target '{label}': Key Vault secret names cannot contain underscores "
+                f"('{target['key_vault_secret']}')"
+            )
+        if target["ring"] not in (0, 1, 2):
+            errors.append(f"target '{label}': ring must be 0, 1 or 2")
+
+        # A target that renders nothing is almost always a mistake in the
+        # overlay, not an intentional empty space.
+        if not render_for_target(rules, target):
+            errors.append(f"target '{label}': overlay leaves zero rules - check exclude/include_tags")
+
+    return errors
+
+
+def main():
+    rules = load_rules()
+    if not rules:
+        print("no rules found in rules/")
+        return 1
+
+    targets = load_targets()
+    errors = validate_rules(rules) + validate_targets(rules, targets)
 
     if errors:
         print(f"FAILED - {len(errors)} problem(s):\n")
@@ -66,7 +97,14 @@ def main():
             print(f"  - {err}")
         return 1
 
-    print(f"OK - {len(rules)} rule(s) valid across {len(load_customers())} tenant(s)")
+    deployments = {t["deployment_id"] for t in targets}
+    print(
+        f"OK - {len(rules)} rule(s) valid across {len(targets)} target(s) "
+        f"in {len(deployments)} deployment(s)"
+    )
+    for target in targets:
+        count = len(render_for_target(rules, target))
+        print(f"     ring {target['ring']}  {target['id']:32} {count} rule(s)")
     return 0
 
 

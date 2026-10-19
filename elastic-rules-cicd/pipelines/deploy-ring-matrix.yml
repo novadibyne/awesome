@@ -1,0 +1,103 @@
+# OPTIONAL variant of deploy-ring.yml.
+#
+# Same work, but each DEPLOYMENT becomes its own parallel job in the pipeline
+# UI, so a failure is attributable at a glance without opening the Tests tab.
+# Each leg still covers all of that deployment's spaces.
+#
+# Trade-off: ADO matrix is only available on plain jobs, not deployment jobs,
+# so the approval gate needs its own tiny deployment job in front. Three jobs
+# instead of one. Use this when you have enough deployments that per-leg
+# visibility is worth the extra moving parts.
+#
+# To use it, swap the template reference in azure-pipelines.yml.
+
+parameters:
+  - name: ring
+    type: number
+  - name: environmentName
+    type: string
+  - name: displayName
+    type: string
+  - name: pythonVersion
+    type: string
+    default: '3.12'
+  - name: azureSubscription
+    type: string
+    default: ''
+  - name: keyVaultUrl
+    type: string
+    default: ''
+  - name: maxParallelJobs
+    type: number
+    default: 5
+
+jobs:
+  # 1. The gate. Does nothing except bind to the Environment so its approval
+  #    check runs before anything is sent.
+  - deployment: gate_ring_${{ parameters.ring }}
+    displayName: Approval gate - ${{ parameters.displayName }}
+    environment: ${{ parameters.environmentName }}
+    pool:
+      vmImage: ubuntu-latest
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - checkout: none
+            - script: echo "Approved, replicating ring ${{ parameters.ring }}"
+              displayName: Approved
+
+  # 2. Work out which deployments are in this ring, as a matrix.
+  - job: plan_ring_${{ parameters.ring }}
+    displayName: Plan ring ${{ parameters.ring }}
+    dependsOn: gate_ring_${{ parameters.ring }}
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+      - task: UsePythonVersion@0
+        inputs:
+          versionSpec: ${{ parameters.pythonVersion }}
+      - script: pip install -r requirements.txt
+        displayName: Install dependencies
+      - script: python scripts/plan_matrix.py --ring ${{ parameters.ring }}
+        name: setMatrix
+        displayName: Build deployment matrix
+
+  # 3. One leg per deployment.
+  - job: replicate_ring_${{ parameters.ring }}
+    displayName: Replicate
+    dependsOn: plan_ring_${{ parameters.ring }}
+    pool:
+      vmImage: ubuntu-latest
+    strategy:
+      maxParallel: ${{ parameters.maxParallelJobs }}
+      matrix: $[ dependencies.plan_ring_${{ parameters.ring }}.outputs['setMatrix.matrix'] ]
+    steps:
+      - task: UsePythonVersion@0
+        inputs:
+          versionSpec: ${{ parameters.pythonVersion }}
+
+      - script: pip install -r requirements-azure.txt
+        displayName: Install dependencies
+
+      - task: AzureCLI@2
+        displayName: Replicate $(deploymentId)
+        inputs:
+          azureSubscription: ${{ parameters.azureSubscription }}
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: |
+            python scripts/deploy.py \
+              --deployment "$(deploymentId)" \
+              --key-source keyvault \
+              --key-vault-url "${{ parameters.keyVaultUrl }}" \
+              --junit-out "$(Build.ArtifactStagingDirectory)/$(deploymentId)-results.xml"
+
+      - task: PublishTestResults@2
+        displayName: Publish per-space results
+        condition: succeededOrFailed()
+        inputs:
+          testResultsFormat: JUnit
+          testResultsFiles: '$(Build.ArtifactStagingDirectory)/$(deploymentId)-results.xml'
+          testRunTitle: 'Ring ${{ parameters.ring }} - $(deploymentId)'
+          failTaskOnFailedTests: false

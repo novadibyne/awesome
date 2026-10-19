@@ -1,8 +1,13 @@
-# Reusable deployment job for one ring.
+# Replicate rules to every deployment and space in one ring.
 #
-# Uses a deployment job so it binds to an ADO Environment, which is where
-# approval gates live. Note the explicit `checkout: self` - deployment jobs
-# do NOT check out the repo by default, unlike normal jobs.
+# A deployment job binds to an ADO Environment, which is where approval gates
+# live. Fan-out across deployments and spaces happens inside deploy.py
+# (concurrently, --max-parallel), not as ADO matrix legs - one job keeps the
+# approval gate and the whole ring's result in a single place. Per-target rows
+# still show up in the pipeline UI via the published JUnit file.
+#
+# NOTE: deployment jobs do NOT check out the repo by default. Hence the
+# explicit `checkout: self`.
 
 parameters:
   - name: ring
@@ -14,8 +19,8 @@ parameters:
   - name: pythonVersion
     type: string
     default: '3.12'
-  # 'env'      -> keys come from the variable group, mapped below by hand
-  # 'keyvault' -> deploy.py reads Key Vault directly, no per-tenant mapping
+  # 'keyvault' -> deploy.py reads Key Vault directly, no per-deployment mapping
+  # 'env'      -> keys come from the variable group, mapped by hand below
   - name: keySource
     type: string
     default: keyvault
@@ -25,6 +30,15 @@ parameters:
   - name: keyVaultUrl
     type: string
     default: ''
+  - name: maxParallel
+    type: number
+    default: 8
+  # Fraction of targets allowed to fail without failing the stage. Keep 0 for
+  # rings 0 and 1. For a wide ring 2, a small budget stops one unreachable
+  # tenant blocking the other 200.
+  - name: failThreshold
+    type: string
+    default: '0.0'
 
 jobs:
   - deployment: deploy_ring_${{ parameters.ring }}
@@ -51,29 +65,48 @@ jobs:
                   displayName: Install dependencies
 
                 - task: AzureCLI@2
-                  displayName: Deploy ring ${{ parameters.ring }}
+                  displayName: Replicate to ring ${{ parameters.ring }}
                   inputs:
                     azureSubscription: ${{ parameters.azureSubscription }}
                     scriptType: bash
                     scriptLocation: inlineScript
-                    # az login from the service connection leaves a session that
-                    # DefaultAzureCredential picks up inside deploy.py.
+                    # az login from the service connection leaves a session
+                    # that DefaultAzureCredential picks up inside deploy.py.
                     inlineScript: |
                       python scripts/deploy.py \
                         --ring ${{ parameters.ring }} \
                         --key-source keyvault \
-                        --key-vault-url "${{ parameters.keyVaultUrl }}"
+                        --key-vault-url "${{ parameters.keyVaultUrl }}" \
+                        --max-parallel ${{ parameters.maxParallel }} \
+                        --fail-threshold ${{ parameters.failThreshold }} \
+                        --junit-out "$(Build.ArtifactStagingDirectory)/ring-${{ parameters.ring }}-results.xml"
 
             - ${{ if eq(parameters.keySource, 'env') }}:
                 - script: pip install -r requirements.txt
                   displayName: Install dependencies
 
-                - script: python scripts/deploy.py --ring ${{ parameters.ring }}
-                  displayName: Deploy ring ${{ parameters.ring }}
+                - script: |
+                    python scripts/deploy.py \
+                      --ring ${{ parameters.ring }} \
+                      --max-parallel ${{ parameters.maxParallel }} \
+                      --fail-threshold ${{ parameters.failThreshold }} \
+                      --junit-out "$(Build.ArtifactStagingDirectory)/ring-${{ parameters.ring }}-results.xml"
+                  displayName: Replicate to ring ${{ parameters.ring }}
                   # Secret variables are NOT exposed to scripts automatically.
-                  # Every tenant needs a line here. This is the reason the
-                  # keyvault source is the default.
+                  # One line per DEPLOYMENT (spaces share the deployment key).
+                  # This mapping is why keyvault is the default.
                   env:
                     KIBANA_APIKEY_INTERNAL_DEV: $(kibana-apikey-internal-dev)
-                    KIBANA_APIKEY_ACME: $(kibana-apikey-acme)
-                    KIBANA_APIKEY_GLOBEX: $(kibana-apikey-globex)
+                    KIBANA_APIKEY_ACME_PROD: $(kibana-apikey-acme-prod)
+                    KIBANA_APIKEY_GLOBEX_PROD: $(kibana-apikey-globex-prod)
+                    KIBANA_APIKEY_INITECH_PROD: $(kibana-apikey-initech-prod)
+
+            # Shows one pass/fail row per deployment/space in the Tests tab.
+            - task: PublishTestResults@2
+              displayName: Publish per-target results
+              condition: succeededOrFailed()
+              inputs:
+                testResultsFormat: JUnit
+                testResultsFiles: '$(Build.ArtifactStagingDirectory)/ring-${{ parameters.ring }}-results.xml'
+                testRunTitle: 'Ring ${{ parameters.ring }} replication'
+                failTaskOnFailedTests: false

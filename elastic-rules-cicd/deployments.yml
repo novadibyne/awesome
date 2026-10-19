@@ -1,0 +1,74 @@
+# Replication targets: every Elastic deployment, and every Kibana space inside
+# it that should receive rules.
+#
+# A target is one (deployment, space) pair. Rules are replicated to every
+# target in the selected ring.
+#
+# Overlay keys may appear at three levels and are merged in this order:
+#   defaults  ->  deployment  ->  space      (later wins)
+#
+#   index         replace the index patterns on every rule (list)
+#   exclude       rule_ids this target must not receive (lists are unioned)
+#   include_tags  if set, only rules carrying at least one of these tags
+#   enabled       force rules enabled/disabled at this target (bool)
+#
+# Secrets: one API key per DEPLOYMENT (spaces share the deployment's key, as
+# long as the key's role grants securitySolution in each space). Never put a
+# key in this file.
+
+defaults:
+  index:
+    - logs-*
+    - winlogbeat-*
+
+deployments:
+  - id: internal-dev
+    ring: 0
+    kibana_url: https://dev-kibana.example.internal:5601
+    key_vault_secret: kibana-apikey-internal-dev
+    api_key_env: KIBANA_APIKEY_INTERNAL_DEV
+    spaces:
+      - id: default
+
+  - id: acme-prod
+    ring: 1
+    kibana_url: https://acme.kb.eastus.azure.elastic-cloud.com:9243
+    key_vault_secret: kibana-apikey-acme-prod
+    api_key_env: KIBANA_APIKEY_ACME_PROD
+    index:
+      - logs-acme-*
+      - winlogbeat-acme-*
+    spaces:
+      - id: default
+      - id: acme-soc
+      - id: acme-pci
+        # Cardholder-data environment gets a tighter index scope and no
+        # cloud rules.
+        index:
+          - logs-acme-pci-*
+        include_tags:
+          - platform:windows
+
+  - id: globex-prod
+    ring: 2
+    kibana_url: https://globex.kb.eastus.azure.elastic-cloud.com:9243
+    key_vault_secret: kibana-apikey-globex-prod
+    api_key_env: KIBANA_APIKEY_GLOBEX_PROD
+    exclude:
+      - 4f8b1c2e-6a13-4f0e-9c77-2b8d5a1e0f31
+    spaces:
+      - id: soc
+      - id: globex-aws
+        index:
+          - logs-aws.cloudtrail-*
+        include_tags:
+          - platform:aws
+
+  - id: initech-prod
+    ring: 2
+    kibana_url: https://initech.kb.westeu.azure.elastic-cloud.com:9243
+    key_vault_secret: kibana-apikey-initech-prod
+    api_key_env: KIBANA_APIKEY_INITECH_PROD
+    spaces:
+      - id: default
+        enabled: false   # staged rollout: land the rules disabled first

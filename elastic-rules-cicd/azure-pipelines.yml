@@ -1,10 +1,13 @@
-# Elastic detection rules - CI/CD for Azure DevOps + Azure Repos
+# Replicate Elastic detection rules from Azure Repos to every Elastic
+# deployment and Kibana space listed in deployments.yml.
 #
-# PR to main     -> Validate stage only. No secrets, no network, no deploy.
-# Merge to main  -> Validate, then ring 0 (auto), ring 1, ring 2.
-#                   Rings 1 and 2 pause for approval via their ADO Environment.
+# PR to main    -> Validate stage only. No secrets, no network, no deploy.
+# Merge to main -> Validate, then ring 0 (auto), ring 1, ring 2.
+#                  Rings 1 and 2 pause for approval on their ADO Environment.
 #
-# Before the first run, see README.md "Azure DevOps setup".
+# A target is one (deployment, space) pair. Fan-out across targets happens
+# inside scripts/deploy.py. See README.md "Azure DevOps setup" before the
+# first run.
 
 name: rules-$(Date:yyyyMMdd)$(Rev:.r)
 
@@ -15,7 +18,7 @@ trigger:
   paths:
     include:
       - rules/*
-      - customers.yml
+      - deployments.yml
       - scripts/*
       - pipelines/*
       - azure-pipelines.yml
@@ -27,18 +30,20 @@ pr:
 
 variables:
   pythonVersion: '3.12'
-  # Name of the ADO service connection with access to the Key Vault.
+  # ADO service connection with read access to the Key Vault.
   azureSubscription: 'elastic-rules-kv'
   keyVaultUrl: 'https://kv-soc-rules.vault.azure.net/'
   # 'keyvault' or 'env' - see pipelines/deploy-ring.yml
   keySource: 'keyvault'
+  # Concurrent (deployment, space) imports per ring.
+  maxParallel: 8
 
 stages:
   - stage: validate
     displayName: Validate
     jobs:
       - job: validate
-        displayName: Lint and render
+        displayName: Lint and render every target
         pool:
           vmImage: ubuntu-latest
         steps:
@@ -51,12 +56,12 @@ stages:
             displayName: Install dependencies
 
           - script: python scripts/validate.py
-            displayName: Validate rules and tenant overlays
+            displayName: Validate rules and replication targets
 
-          # Proves every tenant still renders a sane rule set before we can
-          # possibly ship anything. Needs no credentials.
+          # Proves every deployment and space still renders a sane rule set
+          # before anything can ship. Needs no credentials.
           - script: python scripts/deploy.py --dry-run
-            displayName: Render all tenants (dry run)
+            displayName: Render all targets (dry run)
 
   - stage: ring0
     displayName: Ring 0 - internal canary
@@ -67,11 +72,13 @@ stages:
         parameters:
           ring: 0
           environmentName: elastic-rules-ring-0
-          displayName: Deploy to internal stack
+          displayName: Replicate to internal stack
           pythonVersion: $(pythonVersion)
           keySource: $(keySource)
           azureSubscription: $(azureSubscription)
           keyVaultUrl: $(keyVaultUrl)
+          maxParallel: $(maxParallel)
+          failThreshold: '0.0'
 
   - stage: ring1
     displayName: Ring 1 - pilot customers
@@ -82,23 +89,30 @@ stages:
         parameters:
           ring: 1
           environmentName: elastic-rules-ring-1
-          displayName: Deploy to pilot customers
+          displayName: Replicate to pilot deployments and spaces
           pythonVersion: $(pythonVersion)
           keySource: $(keySource)
           azureSubscription: $(azureSubscription)
           keyVaultUrl: $(keyVaultUrl)
+          maxParallel: $(maxParallel)
+          failThreshold: '0.0'
 
   - stage: ring2
     displayName: Ring 2 - all remaining customers
     dependsOn: ring1
     condition: succeeded()
     jobs:
+      # Swap to pipelines/deploy-ring-matrix.yml for one parallel job per
+      # deployment in the pipeline UI.
       - template: pipelines/deploy-ring.yml
         parameters:
           ring: 2
           environmentName: elastic-rules-ring-2
-          displayName: Deploy to all remaining customers
+          displayName: Replicate to all remaining deployments and spaces
           pythonVersion: $(pythonVersion)
           keySource: $(keySource)
           azureSubscription: $(azureSubscription)
           keyVaultUrl: $(keyVaultUrl)
+          maxParallel: $(maxParallel)
+          # One unreachable tenant should not block the rest of the fleet.
+          failThreshold: '0.05'
