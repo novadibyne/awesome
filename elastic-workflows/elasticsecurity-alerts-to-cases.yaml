@@ -6,6 +6,7 @@ description: >-
   the case that is already open instead of opening a duplicate.
   TESTING: currently runs every minute — see the scheduled trigger below.
 enabled: true
+# Workflow schema version, not a revision number — the editor only accepts "1".
 version: "1"
 tags:
   - security
@@ -97,7 +98,7 @@ consts:
 #
 #   Workflow timeout     settings.timeout — duration regex, same restriction.
 #
-#   Rule names per run   `find_alert_kinds` aggs.by_rule_name.terms.size
+#   Rule names per run   `find_alert_kinds` aggregations.by_rule_name.terms.size
 #   (50)                 `process_alert_kinds` max-iterations
 #                        Rule names beyond this cap are DROPPED SILENTLY by the
 #                        aggregation. `log_scan_result` now reports when that
@@ -183,7 +184,10 @@ steps:
             # to include them.
             - exists:
                 field: kibana.alert.building_block_type
-      aggs:
+      # Full name, not the `aggs` shorthand: the step schema only accepts
+      # `aggregations` ("Property aggs is not allowed"). Elasticsearch treats the
+      # two the same, and the response key is `aggregations` either way.
+      aggregations:
         by_rule_name:
           terms:
             # The bucket key is the full rule name, a plain string, so the steps
@@ -193,7 +197,7 @@ steps:
             # dropped by Elasticsearch, not by the workflow — the count of alerts
             # left behind comes back as `sum_other_doc_count` and is logged below.
             size: 50
-          aggs:
+          aggregations:
             # The rule that produced the alerts, for display in the case. For an
             # External Alerts name this is the External Alerts rule itself.
             rule_uuid:
