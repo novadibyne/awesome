@@ -1,0 +1,563 @@
+name: elasticsecurity-alerts-to-cases
+description: >-
+  On a schedule, scan the elastic detection alerts index, group new alerts by
+  detection rule name, and open one case per rule name. Alerts that already belong
+  to a case are skipped, and later alerts with the same rule name are attached to
+  the case that is already open instead of opening a duplicate.
+  TESTING: currently runs every minute — see the scheduled trigger below.
+enabled: true
+version: "1"
+tags:
+  - security
+  - cases
+  - automation
+
+triggers:
+  # Manual runs are useful for testing and for backfilling after an outage.
+  - type: manual
+  - type: scheduled
+    with:
+      # TESTING SETTING. 1m is the minimum interval Workflows accepts.
+      # For production restore `every: "30m"` here and `lookback: "now-35m"` below
+      # — the two must be changed together, lookback always wider than the schedule.
+      every: "5m"
+
+settings:
+  timeout: "30m"
+  concurrency:
+    # Never let two runs overlap: a second run scanning the same window before the
+    # first one has written kibana.alert.case_ids back would open duplicate cases.
+    strategy: drop
+
+# =============================================================================
+# CUSTOMER SETTINGS — everything in `consts` can be changed per deployment
+# without touching the steps.
+#
+# WHY ONLY THESE: the editor validates each step's `with` block against a typed
+# schema, and a "{{ }}" template is a string. So a const can only stand in where
+# the target field is string-typed. Numbers, booleans, arrays and enums must be
+# YAML literals; a template there fails to save with
+# `Incorrect type. Expected "<type>"`.
+#
+# The per-customer values that CANNOT live here are listed in the block below.
+# Work through both when onboarding a new customer.
+# =============================================================================
+consts:
+  # Shown in the case title and applied as a case tag. Use whatever identifies
+  # the tenant to your analysts. Keep it short: it counts towards Kibana's
+  # 160-character case title limit (see `create_case`).
+  customer_name: "radiusgs"
+
+  # Alerts-as-data index. For a Kibana space named <space>, this is
+  # `.alerts-security.alerts-<space>`; the wildcard also covers the concrete
+  # `.internal.alerts-security.alerts-<space>-*` backing indices.
+  # The workflow must be installed in that same space.
+  alerts_index: ".alerts-security.alerts-radiusgs*"
+
+  # Scan window. Always wider than the schedule interval so ingest lag and
+  # scheduler jitter can't drop an alert between two runs. The overlap is safe
+  # because alerts already attached to a case are filtered out below.
+  #
+  # Must be moved by hand whenever the schedule changes — the schedule itself is
+  # not a const (see below), so nothing keeps these two in step for you.
+  #
+  # TESTING SETTING, paired with the 1m schedule above. Production value is
+  # "now-35m" against a 30m schedule.
+  lookback: "now-45m"
+
+  # Which alerts are in scope. "open" skips alerts already acknowledged or closed.
+  alert_status: "open"
+
+  # Case owner: securitySolution, observability, or cases.
+  case_owner: "securitySolution"
+
+  # Case category. To leave cases uncategorised, delete the `category:` line from
+  # `create_case` rather than setting this to "" — an empty category may be
+  # rejected at runtime.
+  case_category: "Detection alert"
+
+  # Free tag applied to every case, alongside the customer name and the dedupe tag.
+  environment_tag: "automated"
+
+  # The dedupe key. Every case this workflow opens is tagged
+  # `<prefix>:<rule name>`, and that tag is how the next run finds the case again.
+  # Keep it distinct per customer if several tenants share a Kibana space.
+  #
+  # Keep it to 55 characters or fewer: Kibana caps a tag at 256 characters, and
+  # the rule name part of the tag is cut to 200.
+  dedupe_tag_prefix: "radiusgs-auto-rule"
+
+# =============================================================================
+# NOT PARAMETERISABLE — these are per-customer decisions that the schema forces
+# to be literals. Edit them in place at the locations named.
+#
+#   Schedule interval    triggers[].with.every
+#                        Validated against /^(([6-9]\d|\d{3,})s|\d+[mhd])$/, so a
+#                        template is rejected. Change it here AND move `lookback`.
+#
+#   Workflow timeout     settings.timeout — duration regex, same restriction.
+#
+#   Rule names per run   `find_alert_kinds` aggs.by_rule_name.terms.size
+#   (50)                 `process_alert_kinds` max-iterations
+#                        Rule names beyond this cap are DROPPED SILENTLY by the
+#                        aggregation. `log_scan_result` now reports when that
+#                        happens — raise both numbers together if it does.
+#
+#   Alerts per rule      `collect_alerts_for_rule` with.size
+#   name (500)           `attach_alerts_to_case` max-iterations
+#
+#   Case reuse           the `>= 500` in the `resolve_case` AND `finalize_case`
+#   threshold (500)      conditions — both must match, they ask the same question.
+#                        INVARIANT: this threshold + alerts per rule <= 1000,
+#                        Kibana's hard MAX_ALERTS_PER_CASE. Change one, change
+#                        the other.
+#
+#   Title name length    the `truncate: 100` in `create_case` title. Kibana
+#   (100)                rejects a case title over 160 characters.
+#
+#   Dedupe tag name      the `truncate: 200, ''` in the dedupe tag. It appears in
+#   length (200)         BOTH `find_existing_case` and `create_case` and the two
+#                        templates must stay identical, or every run opens a new
+#                        case.
+#
+#   Reusable statuses    `find_existing_case` with.status — typed array
+#
+#   Case severities      the four `cases.setSeverity` steps — enum
+#
+#   Building block       the `building_block_type` clause in both must_not blocks.
+#   alerts               Delete from both to include them; see the README.
+#
+#   Workflow name        top-level `name` and `tags` are the workflow's own
+#   and tags             identity, not step inputs, so consts do not reach them.
+#                        Rename per deployment. Note that changing `name` in the
+#                        editor may create a new workflow rather than rename the
+#                        existing one — check before saving over a live workflow.
+# =============================================================================
+
+steps:
+  # ---------------------------------------------------------------------------
+  # 1. Find the distinct "kinds" of alert in the window.
+  #
+  # "Kind" is the alert's rule name (kibana.alert.rule.name), not the rule that
+  # fired. For an ordinary detection rule the two are the same thing. For a rule
+  # with `rule_name_override` — the prebuilt External Alerts rule sets it to
+  # event.reason — every alert carries its own name, e.g.
+  #   Process govagentx64.exe was detected by the report "..." in watchlist "..."
+  # so grouping on the name splits that one rule into one case per kind of
+  # external alert instead of piling every Carbon Black alert into a single case.
+  #
+  # Alerts that already carry kibana.alert.case_ids are excluded here — that field
+  # is written back by Cases when an alert is attached, so it is the record of "a
+  # case already exists for this alert" and it makes this whole workflow
+  # idempotent.
+  #
+  # The editor cannot infer the shape of an aggregation response, so it will warn
+  # that `foreach.item.*` below is of unknown type. That is a static-analysis
+  # limitation, not an error — the buckets are a real array at runtime.
+  # ---------------------------------------------------------------------------
+  - name: find_alert_kinds
+    type: elasticsearch.search
+    with:
+      index: "{{ consts.alerts_index }}"
+      size: 0
+      query:
+        bool:
+          filter:
+            - range:
+                "@timestamp":
+                  gte: "{{ consts.lookback }}"
+                  lte: "now"
+            - term:
+                kibana.alert.workflow_status: "{{ consts.alert_status }}"
+          must_not:
+            # Already attached to a case by a previous run (or by an analyst).
+            # This is what makes the workflow idempotent.
+            - exists:
+                field: kibana.alert.case_ids
+            # Building block alerts are excluded by choice. Note this is not a
+            # small filter: rules tagged "Rule Type: BBR" set
+            # kibana.alert.building_block_type on every alert they produce, so
+            # each such rule is dropped in full and never opens a case, no matter
+            # how many alerts it fires. High-volume rules are disproportionately
+            # likely to be building blocks. Delete this clause from both searches
+            # to include them.
+            - exists:
+                field: kibana.alert.building_block_type
+      aggs:
+        by_rule_name:
+          terms:
+            # The bucket key is the full rule name, a plain string, so the steps
+            # below read it straight off `foreach.item.key`.
+            field: kibana.alert.rule.name
+            # Cap on distinct rule names handled per run. Names past this cap are
+            # dropped by Elasticsearch, not by the workflow — the count of alerts
+            # left behind comes back as `sum_other_doc_count` and is logged below.
+            size: 50
+          aggs:
+            # The rule that produced the alerts, for display in the case. For an
+            # External Alerts name this is the External Alerts rule itself.
+            rule_uuid:
+              terms:
+                field: kibana.alert.rule.uuid
+                size: 1
+            # Severity present in the batch, for display in the case description.
+            severity:
+              terms:
+                field: kibana.alert.severity
+                size: 4
+                order:
+                  _count: desc
+            # Exact counts per severity. The case takes the *highest* severity
+            # present in the batch, resolved by the priority chain further down —
+            # one critical alert among a hundred low ones should not be filed as a
+            # low case. `doc_count` is a plain integer, so the chain can test it
+            # with the same `> 0` KQL form used elsewhere in this workflow.
+            sev_critical:
+              filter:
+                term:
+                  kibana.alert.severity: "critical"
+            sev_high:
+              filter:
+                term:
+                  kibana.alert.severity: "high"
+            sev_medium:
+              filter:
+                term:
+                  kibana.alert.severity: "medium"
+            max_risk_score:
+              max:
+                field: kibana.alert.risk_score
+            first_seen:
+              min:
+                field: "@timestamp"
+            last_seen:
+              max:
+                field: "@timestamp"
+
+  # `sum_other_doc_count` is the number of in-scope alerts belonging to rule names
+  # that did not fit in the top-50 buckets. Anything above 0 means names were
+  # dropped this run and will keep being dropped while they stay outside the top
+  # 50 — a silent gap unless it is surfaced here.
+  - name: log_scan_result
+    type: console
+    with:
+      message: >-
+        Scanned {{ consts.alerts_index }} since {{ consts.lookback }}:
+        {{ steps.find_alert_kinds.output.aggregations.by_rule_name.buckets | size }}
+        rule name(s) with alerts that are not yet in a case.
+        Alerts belonging to rule names beyond the 50-name cap (0 is healthy):
+        {{ steps.find_alert_kinds.output.aggregations.by_rule_name.sum_other_doc_count }}.
+
+  # ---------------------------------------------------------------------------
+  # 2. One iteration per rule name: reuse a case if one is already open,
+  #    otherwise create one, then attach every un-cased alert with that name.
+  # ---------------------------------------------------------------------------
+  - name: process_alert_kinds
+    type: foreach
+    foreach: "${{ steps.find_alert_kinds.output.aggregations.by_rule_name.buckets }}"
+    # Plain-number form. The object form ({ limit, on-limit }) is also valid, but
+    # `limit` must be a literal integer either way.
+    max-iterations: 50
+    iteration-on-failure:
+      # One rule name failing (a deleted case, a permissions gap) must not stop
+      # the remaining names in this run from being triaged.
+      continue: true
+    steps:
+      # Re-query for the individual alert IDs. The aggregation above only gave us
+      # bucket keys and counts; addAlerts needs each alert's _id and _index.
+      - name: collect_alerts_for_rule
+        type: elasticsearch.search
+        with:
+          index: "{{ consts.alerts_index }}"
+          # Cap on alerts attached per rule name per run.
+          size: 500
+          # _id and _index are all Cases needs to resolve an alert attachment.
+          _source: false
+          # `sort` is typed as a string by the step schema, and is passed through to
+          # the search *body*. A bare field name is required: the "<field>:<dir>"
+          # shorthand only parses as a URL query parameter, and in the body it is
+          # read as a literal field name ("No mapping found for [@timestamp:asc]").
+          # A body sort on a plain field name is ascending by default.
+          sort: "@timestamp"
+          query:
+            bool:
+              filter:
+                # Exact match on the keyword field the aggregation bucketed on.
+                - term:
+                    kibana.alert.rule.name: "{{ foreach.item.key }}"
+                - range:
+                    "@timestamp":
+                      gte: "{{ consts.lookback }}"
+                      lte: "now"
+                - term:
+                    kibana.alert.workflow_status: "{{ consts.alert_status }}"
+              must_not:
+                - exists:
+                    field: kibana.alert.case_ids
+                # Keep in step with the must_not block in `find_alert_kinds`.
+                - exists:
+                    field: kibana.alert.building_block_type
+
+      # The two searches run moments apart, so a bucket can be empty by now (an
+      # analyst attached the alerts by hand in between). Never open an empty case.
+      - name: triage_rule
+        type: if
+        condition: "steps.collect_alerts_for_rule.output.hits.total.value > 0"
+        steps:
+          # ---------------------------------------------------------------
+          # 2a. Is a case for this rule name already open?
+          #
+          # The dedupe tag carries the rule name cut to 200 characters, with
+          # surrounding whitespace stripped, so prefix + name stays inside
+          # Kibana's 256-character tag limit. External Alerts names can run
+          # well past that. This template MUST stay identical to the first tag
+          # in `create_case`, or the case is never found again and every run
+          # opens a new one.
+          # ---------------------------------------------------------------
+          - name: find_existing_case
+            type: cases.findCases
+            with:
+              owner: "{{ consts.case_owner }}"
+              # Literal array: an existing case is only reused while it is in one
+              # of these states. A closed case is left alone and a fresh case is
+              # opened instead, so reopening is always a deliberate human decision.
+              status: ["open", "in-progress"]
+              tags: ["{{ consts.dedupe_tag_prefix }}:{{ foreach.item.key | truncate: 200, '' | strip }}"]
+              sortField: "createdAt"
+              sortOrder: "desc"
+              perPage: 1
+
+          # ---------------------------------------------------------------
+          # Reuse the open case for this rule name ONLY while it has room.
+          #
+          # Kibana caps a case at MAX_ALERTS_PER_CASE = 1000 attached alerts —
+          # a hard constant, not configurable. Past it every addAlerts call
+          # fails with "Case has reached the maximum allowed number (1000) of
+          # attached alerts". Because the attach loop runs with
+          # `iteration-on-failure: continue`, those failures are swallowed: the
+          # alerts never receive kibana.alert.case_ids, so the next run selects
+          # the very same alerts and fails again. A high-volume rule wedges
+          # permanently and looks exactly like "this rule never opens a case".
+          #
+          # So when the current case is full, fall through to `create_case` and
+          # start a new one. Since `find_existing_case` sorts by createdAt desc
+          # and takes one, the newest case for the rule name is always the live
+          # one, and rollover needs no extra bookkeeping.
+          #
+          # THRESHOLD INVARIANT: reuse threshold + alerts attached per run must
+          # be <= 1000, or a batch can still overflow a case it was allowed into.
+          # Here 500 + 500 = 1000, so a case tops out at 999. Raising the 500 in
+          # `collect_alerts_for_rule` means lowering the 500 below by the same
+          # amount. Cases therefore hold between 500 and 999 alerts; to pack them
+          # fuller, lower the per-run batch and raise this threshold together.
+          #
+          # The test is written as `not (... >= 500)` rather than `... < 500` on
+          # purpose. If `totalAlerts` were ever absent from the response, the
+          # comparison is false either way — but this phrasing then falls to
+          # REUSE (worst case: the old cap behaviour) instead of CREATE, which
+          # would open a fresh case on every single run.
+          # ---------------------------------------------------------------
+          - name: resolve_case
+            type: if
+            condition: "steps.find_existing_case.output.total > 0 and not (steps.find_existing_case.output.cases[0].totalAlerts >= 500)"
+            steps:
+              - name: reuse_existing_case
+                type: data.set
+                with:
+                  case_id: "{{ steps.find_existing_case.output.cases[0].id }}"
+            else:
+              - name: create_case
+                type: cases.createCase
+                with:
+                  # Case name mirrors the alert, prefixed with the customer and
+                  # with the date and time appended.
+                  #
+                  # Kibana rejects a case title over 160 characters ("The length
+                  # of the title is too long"), and External Alerts names are
+                  # often longer than that on their own. The name is cut to 100
+                  # characters (ending in "..." when cut), which leaves room for
+                  # the customer prefix and the timestamp. The full name is kept
+                  # in the description table below.
+                  title: >-
+                    [{{ consts.customer_name }}]
+                    {{ foreach.item.key | truncate: 100 }}
+                    - {{ execution.startedAt | date: '%Y-%m-%d %H:%M:%S %Z' }}
+                  owner: "{{ consts.case_owner }}"
+                  category: "{{ consts.case_category }}"
+                  # `severity` is enum-typed and so cannot be templated here. The
+                  # alert's severity is applied by the priority chain below.
+                  description: |
+                    Opened automatically by the **{{ workflow.name }}** workflow.
+
+                    | Field | Value |
+                    |---|---|
+                    | Detection rule name | `{{ foreach.item.key }}` |
+                    | Rule ID | `{{ foreach.item.rule_uuid.buckets[0].key | default: 'unknown' }}` |
+                    | Most common alert severity | {{ foreach.item.severity.buckets[0].key | default: 'unset' }} |
+                    | Severity counts | critical {{ foreach.item.sev_critical.doc_count }}, high {{ foreach.item.sev_high.doc_count }}, medium {{ foreach.item.sev_medium.doc_count }} (remainder low) |
+                    | Alerts index | `{{ consts.alerts_index }}` |
+                    | Alerts in this batch | {{ steps.collect_alerts_for_rule.output.hits.total.value }} |
+                    | First alert in batch | {{ foreach.item.first_seen.value_as_string }} |
+                    | Latest alert in batch | {{ foreach.item.last_seen.value_as_string }} |
+                    | Highest risk score | {{ foreach.item.max_risk_score.value | default: 'n/a' }} |
+                    | Opened at | {{ execution.startedAt | date: '%Y-%m-%d %H:%M:%S %Z' }} |
+
+                    Further alerts with this rule name are attached to this case
+                    automatically for as long as it stays open or in progress.
+                    Closing the case stops that: the next matching alert opens a
+                    new case instead.
+
+                    Kibana caps a case at 1000 attached alerts, so a busy rule
+                    name rolls over into a fresh case once this one fills up.
+                    Several cases with this rule name are expected — the
+                    timestamp in the title tells them apart, and the newest is the
+                    live one.
+
+                    [Workflow execution]({{ execution.url }})
+                  tags:
+                    # First tag is the dedupe key this workflow looks up. Editing
+                    # or removing it detaches the case from the automation. It
+                    # must render exactly as the tag in `find_existing_case`.
+                    - "{{ consts.dedupe_tag_prefix }}:{{ foreach.item.key | truncate: 200, '' | strip }}"
+                    - "{{ consts.customer_name }}"
+                    - "{{ consts.environment_tag }}"
+                  settings:
+                    # Keep alert workflow_status in step with the case, so closing
+                    # the case also takes its alerts out of scope for future runs.
+                    syncAlerts: true
+
+              - name: store_new_case_id
+                type: data.set
+                with:
+                  case_id: "{{ steps.create_case.output.case.id }}"
+
+          # ---------------------------------------------------------------
+          # 2b. Attach the alerts. Same path for a new and a reused case.
+          #
+          # `alerts` is a typed array, so it has to be a YAML literal — a
+          # "${{ ... }}" template is rejected. Hence one call per alert inside a
+          # nested loop rather than one bulk call over a mapped array.
+          # ---------------------------------------------------------------
+          - name: attach_alerts_to_case
+            type: foreach
+            foreach: "${{ steps.collect_alerts_for_rule.output.hits.hits }}"
+            max-iterations: 500
+            iteration-on-failure:
+              # A single unattachable alert shouldn't abandon the rest of the batch.
+              continue: true
+            steps:
+              - name: attach_one_alert
+                type: cases.addAlerts
+                with:
+                  case_id: "{{ variables.case_id }}"
+                  alerts:
+                    # Inner loop: `foreach.item` is the search hit, not the bucket.
+                    - alertId: "{{ foreach.item._id }}"
+                      index: "{{ foreach.item._index }}"
+
+          # ---------------------------------------------------------------
+          # 2c. Finish the case. Deliberately after the attachment loop: if a
+          # severity call fails, the alerts are already on the case.
+          #
+          # Outside the nested loop, `foreach.item` is the rule name bucket again.
+          # ---------------------------------------------------------------
+          # This condition MUST stay identical to `resolve_case` above: it is the
+          # same question ("did we reuse a case, or make a new one?"). Testing
+          # only `total > 0` here would misroute a rollover case — one that is
+          # brand new even though a previous case for the rule name exists — into
+          # the comment branch, leaving its severity unset.
+          - name: finalize_case
+            type: if
+            condition: "steps.find_existing_case.output.total > 0 and not (steps.find_existing_case.output.cases[0].totalAlerts >= 500)"
+            steps:
+              # Reused case: note that more of the same kind arrived. Its severity
+              # is left alone so an analyst's triage is not overwritten each run.
+              - name: add_new_alerts_comment
+                type: cases.addComment
+                with:
+                  case_id: "{{ variables.case_id }}"
+                  comment: |
+                    **{{ steps.collect_alerts_for_rule.output.hits.total.value }} new alert(s)**
+                    with the same rule name were attached by the
+                    **{{ workflow.name }}** workflow at
+                    {{ execution.startedAt | date: '%Y-%m-%d %H:%M:%S %Z' }}.
+
+                    | Field | Value |
+                    |---|---|
+                    | Detection rule name | `{{ foreach.item.key }}` |
+                    | Rule ID | `{{ foreach.item.rule_uuid.buckets[0].key | default: 'unknown' }}` |
+                    | Latest alert | {{ foreach.item.last_seen.value_as_string }} |
+                    | Highest risk score in batch | {{ foreach.item.max_risk_score.value | default: 'n/a' }} |
+
+                    [Workflow execution]({{ execution.url }})
+            else:
+              # New case: set its severity to the highest severity in the batch.
+              #
+              # `cases.createCase.severity` is enum-typed and rejects a template,
+              # so the value cannot be passed at creation. This chain tests the
+              # per-severity aggregation counts in descending order and applies the
+              # first match with a literal, falling through to `low`.
+              #
+              # A new case is created at severity `low` by default, so if this
+              # chain silently does nothing the result is indistinguishable from a
+              # correct `low` mapping — check the execution log for which branch
+              # ran, not just the resulting case.
+              - name: severity_critical
+                type: if
+                condition: "foreach.item.sev_critical.doc_count > 0"
+                steps:
+                  - name: set_case_severity_critical
+                    type: cases.setSeverity
+                    with:
+                      case_id: "{{ variables.case_id }}"
+                      severity: "critical"
+                else:
+                  - name: severity_high
+                    type: if
+                    condition: "foreach.item.sev_high.doc_count > 0"
+                    steps:
+                      - name: set_case_severity_high
+                        type: cases.setSeverity
+                        with:
+                          case_id: "{{ variables.case_id }}"
+                          severity: "high"
+                    else:
+                      - name: severity_medium
+                        type: if
+                        condition: "foreach.item.sev_medium.doc_count > 0"
+                        steps:
+                          - name: set_case_severity_medium
+                            type: cases.setSeverity
+                            with:
+                              case_id: "{{ variables.case_id }}"
+                              severity: "medium"
+                        else:
+                          - name: set_case_severity_low
+                            type: cases.setSeverity
+                            with:
+                              case_id: "{{ variables.case_id }}"
+                              severity: "low"
+
+          # Logs what the severity chain was given, and the alert count of the
+          # case that was found. If every severity count is 0 the batch is all
+          # `low`, and a `low` case is correct rather than a failed mapping.
+          #
+          # `existing case alerts` is the load-bearing number for rollover: it
+          # should climb towards 999 and then reset as a new case takes over. If
+          # it renders EMPTY, `totalAlerts` is missing from the response and the
+          # rollover test is inert — cases will fill to 1000 and wedge again.
+          - name: log_rule_outcome
+            type: console
+            with:
+              message: >-
+                Rule name "{{ foreach.item.key }}"
+                (rule {{ foreach.item.rule_uuid.buckets[0].key | default: 'unknown' }}):
+                attached {{ steps.collect_alerts_for_rule.output.hits.total.value }}
+                alert(s) to case {{ variables.case_id }};
+                existing case alerts before this run =
+                {{ steps.find_existing_case.output.cases[0].totalAlerts | default: 'none' }}
+                (rolls over at 500, Kibana hard cap 1000);
+                severity counts critical={{ foreach.item.sev_critical.doc_count }}
+                high={{ foreach.item.sev_high.doc_count }}
+                medium={{ foreach.item.sev_medium.doc_count }}
+                (remainder low).
