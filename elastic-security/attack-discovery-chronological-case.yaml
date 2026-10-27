@@ -232,14 +232,12 @@ steps:
                   if (doc.containsKey('kibana.alert.original_time') && doc['kibana.alert.original_time'].size() > 0) {
                   emit(doc['kibana.alert.original_time'].value.toInstant().toEpochMilli()); } else if
                   (doc['@timestamp'].size() > 0) { emit(doc['@timestamp'].value.toInstant().toEpochMilli()); }
+          # Plain field names sort ascending (oldest first). Kibana 9.4 only
+          # accepts plain strings here, so no {order: asc} objects.
           sort:
-            - event_time:
-                order: asc
-            - "@timestamp":
-                order: asc
-            - kibana.alert.uuid:
-                order: asc
-                unmapped_type: keyword
+            - event_time
+            - "@timestamp"
+            - kibana.alert.uuid
           fields:
             - field: event_time
               format: "yyyy-MM-dd HH:mm:ss.SSS"
