@@ -6,9 +6,13 @@
 #      (or "Select all").
 #   2. "Selected N Attack discoveries" > Run workflow > pick this workflow.
 #
+#   It also works on ordinary detection alerts (Alerts table > Run workflow,
+#   or the "Alert" tab of the Test workflow dialog): the selected alerts are
+#   then put on the timeline themselves.
+#
 # What it does:
-#   - Collects the alerts behind every selected attack discovery and removes
-#     duplicates (one alert can belong to several discoveries).
+#   - Collects the alerts behind every selected attack discovery (plus any
+#     directly selected alerts) and removes duplicates.
 #   - Orders those alerts by the time the underlying event happened
 #     (kibana.alert.original_time, falling back to @timestamp), not by
 #     attack discovery.
@@ -54,19 +58,29 @@ consts:
 
 steps:
   # ---------------------------------------------------------------------------
-  # 1. Collect the alert IDs referenced by every selected attack discovery.
-  #    event.alerts holds the selected discoveries. Each one lists its alerts
-  #    in kibana.alert.attack_discovery.alert_ids. join/split flattens the list
-  #    of lists, and uniq removes alerts shared by several discoveries.
+  # 1. event.alerts holds what was selected: attack discoveries and/or
+  #    ordinary alerts. Count the discoveries and keep the selected IDs.
+  # ---------------------------------------------------------------------------
+  - name: read_selection
+    type: data.set
+    with:
+      selected_ids: "${{ event.alerts | map: '_id' }}"
+      discovery_count: "${{ event.alerts | where: 'kibana.alert.attack_discovery' | size }}"
+      alerts_index: ".alerts-security.alerts-{{ event.spaceId | default: 'default' }}"
+
+  # ---------------------------------------------------------------------------
+  # 2. Alert IDs to put on the timeline: the alerts behind every discovery
+  #    (kibana.alert.attack_discovery.alert_ids) plus the selected IDs
+  #    themselves. A discovery's own ID matches nothing in the alerts index,
+  #    so adding it is harmless. join/split flattens, uniq removes duplicates.
   # ---------------------------------------------------------------------------
   - name: collect_alert_ids
     type: data.set
     with:
-      alert_ids: "${{ event.alerts | map: 'kibana.alert.attack_discovery.alert_ids' | join: ',' | split: ',' | uniq }}"
-      alerts_index: ".alerts-security.alerts-{{ event.spaceId | default: 'default' }}"
+      alert_ids: "${{ event.alerts | map: 'kibana.alert.attack_discovery.alert_ids' | compact | concat: variables.selected_ids | join: ',' | split: ',' | uniq }}"
 
   # ---------------------------------------------------------------------------
-  # 2. Overview of those alerts: count, first/last event time, hosts, users,
+  # 3. Overview of those alerts: count, first/last event time, hosts, users,
   #    tactics and severities. event_time = original event time, falling back
   #    to the alert's @timestamp.
   # ---------------------------------------------------------------------------
@@ -114,7 +128,7 @@ steps:
             size: 20
 
   # ---------------------------------------------------------------------------
-  # 3. Work out how many timeline comments are needed.
+  # 4. Work out how many timeline comments are needed.
   # ---------------------------------------------------------------------------
   - name: plan_timeline
     type: data.set
@@ -124,18 +138,21 @@ steps:
       page_count: "${{ steps.alerts_overview.output.hits.total.value | at_most: consts.max_alerts | divided_by: consts.events_per_comment | ceil }}"
 
   # ---------------------------------------------------------------------------
-  # 4. Build the case description. The regex turns attack discovery entity
+  # 5. Build the case description. The regex turns attack discovery entity
   #    tokens such as "{{ host.name srv-01 }}" into plain `srv-01`.
   # ---------------------------------------------------------------------------
   - name: case_description
     type: data.regexReplace
     source: |
-      ## Attack timeline across {{ event.alerts | size }} attack discoveries
+      {%- assign ads = event.alerts | where: 'kibana.alert.attack_discovery' -%}
+      {%- assign direct_count = event.alerts.size | minus: ads.size -%}
+      ## Chronological event timeline
 
-      The {{ variables.included_alerts }} alerts behind the selected attack discoveries, merged into one timeline and ordered by **when each event happened**, not by discovery.
+      The {{ variables.included_alerts }} alerts behind the selection, merged into one timeline and ordered by **when each event happened**, not by attack discovery.
 
       | | |
       |---|---|
+      | **Selected** | {{ ads.size }} attack discoveries{% if direct_count > 0 %}, {{ direct_count }} alerts{% endif %} |
       | **First event (UTC)** | {{ steps.alerts_overview.output.aggregations.first_event.value_as_string | default: 'n/a' }} |
       | **Last event (UTC)** | {{ steps.alerts_overview.output.aggregations.last_event.value_as_string | default: 'n/a' }} |
       | **Alerts** | {{ variables.total_alerts }}{% if variables.total_alerts > variables.included_alerts %} (only the first {{ variables.included_alerts }} are in this case: Cases allows {{ consts.max_alerts }} alerts per case){% endif %} |
@@ -143,16 +160,17 @@ steps:
       | **Hosts** | {{ steps.alerts_overview.output.aggregations.hosts.buckets | map: 'key' | join: ', ' | replace: '|', '\\|' | default: 'n/a' }}{% if steps.alerts_overview.output.aggregations.hosts.sum_other_doc_count > 0 %}, ...{% endif %} |
       | **Users** | {{ steps.alerts_overview.output.aggregations.users.buckets | map: 'key' | join: ', ' | replace: '|', '\\|' | default: 'n/a' }}{% if steps.alerts_overview.output.aggregations.users.sum_other_doc_count > 0 %}, ...{% endif %} |
       | **MITRE ATT&CK tactics** | {{ steps.alerts_overview.output.aggregations.tactics.buckets | map: 'key' | join: ', ' | default: 'n/a' }} |
-
+      {% if ads.size > 0 %}
       ### Attack discoveries in this case
 
       The **AD** column of the timeline refers to these numbers.
-      {% for d in event.alerts %}
+      {% for d in ads %}
       {%- assign ad = d.kibana.alert.attack_discovery %}
       **AD-{{ forloop.index }}: {{ ad.title_with_replacements | default: ad.title | strip_newlines | truncate: 200 }}** ({{ ad.alert_ids | size }} alerts{% if ad.mitre_attack_tactics != blank %}; {{ ad.mitre_attack_tactics | join: ', ' }}{% endif %})
 
       {{ ad.summary_markdown_with_replacements | default: ad.summary_markdown | truncate: 400 }}
       {% endfor %}
+      {%- endif %}
       ### Timeline
 
       The timeline is posted as comments on this case, oldest event first, {{ consts.events_per_comment }} events per comment. Every alert is also attached to the case (**Alerts** tab).
@@ -165,14 +183,19 @@ steps:
       flags: g
 
   # ---------------------------------------------------------------------------
-  # 5. Create the case.
+  # 6. Create the case.
   # ---------------------------------------------------------------------------
   - name: create_case
     type: cases.createCase
     with:
       owner: securitySolution
       title: >-
-        Attack timeline: {{ event.alerts[0].kibana.alert.attack_discovery.title_with_replacements | default: event.alerts[0].kibana.alert.attack_discovery.title | strip_newlines | truncate: 110 }}{% if event.alerts.size > 1 %} (+{{ event.alerts.size | minus: 1 }} more){% endif %}
+        {%- assign ads = event.alerts | where: 'kibana.alert.attack_discovery' -%}
+        {%- if ads.size > 0 -%}
+        Attack timeline: {{ ads[0].kibana.alert.attack_discovery.title_with_replacements | default: ads[0].kibana.alert.attack_discovery.title | strip_newlines | truncate: 110 }}{% if ads.size > 1 %} (+{{ ads.size | minus: 1 }} more){% endif %}
+        {%- else -%}
+        Alert timeline: {{ event.alerts.size }} alerts ({{ event.alerts[0].kibana.alert.rule.name | default: 'selected alerts' | strip_newlines | truncate: 100 }})
+        {%- endif -%}
       description: "{{ steps.case_description.output | truncate: 29900 }}"
       severity: >-
         {%- assign sev = steps.alerts_overview.output.aggregations.severities.buckets | map: 'key' -%}
@@ -182,14 +205,14 @@ steps:
         syncAlerts: "${{ consts.sync_alert_status }}"
 
   # ---------------------------------------------------------------------------
-  # 6. Post the timeline in chronological pages and attach the alerts.
+  # 7. Post the timeline in chronological pages and attach the alerts.
   #    foreach.item is the page number (1, 2, 3, ...).
   # ---------------------------------------------------------------------------
   - name: timeline_pages
     type: foreach
     foreach: "${{ (1..variables.page_count) }}"
     steps:
-      # 6a. One page of alerts, oldest event first.
+      # 7a. One page of alerts, oldest event first.
       - name: timeline_page
         type: elasticsearch.search
         with:
@@ -231,7 +254,7 @@ steps:
             - field: process.command_line
             - field: file.path
 
-      # 6b. Post this page of the timeline as a case comment. The final
+      # 7b. Post this page of the timeline as a case comment. The final
       #     truncate only matters if a page is full of extremely long values.
       - name: post_timeline_comment
         type: cases.addComment
@@ -239,9 +262,10 @@ steps:
           case_id: "{{ steps.create_case.output.case.id }}"
           comment: |
             {%- capture page -%}
+            {%- assign ads = event.alerts | where: 'kibana.alert.attack_discovery' -%}
             {%- assign offset = foreach.item | minus: 1 | times: consts.events_per_comment -%}
             {%- assign hits = steps.timeline_page.output.hits.hits -%}
-            ### Attack timeline, part {{ foreach.item }} of {{ foreach.total }} (events {{ offset | plus: 1 }} to {{ offset | plus: hits.size }} of {{ variables.included_alerts }})
+            ### Event timeline, part {{ foreach.item }} of {{ foreach.total }} (events {{ offset | plus: 1 }} to {{ offset | plus: hits.size }} of {{ variables.included_alerts }})
 
             | # | Time (UTC) | Host | User | Alert | Severity | Tactic | What happened | AD |
             |---:|---|---|---|---|---|---|---|---|
@@ -254,18 +278,18 @@ steps:
               {%- assign what = f['kibana.alert.reason'][0] | default: '' | replace: '\r', '' | replace: '\n', ' ' | truncate: 160 | replace: '|', '\\|' -%}
             {%- endif -%}
             {%- assign ad_refs = '' -%}
-            {%- for d in event.alerts -%}
+            {%- for d in ads -%}
               {%- if d.kibana.alert.attack_discovery.alert_ids contains hit._id -%}
                 {%- if ad_refs != '' -%}{%- assign ad_refs = ad_refs | append: ', ' -%}{%- endif -%}
                 {%- assign ad_refs = ad_refs | append: 'AD-' | append: forloop.index -%}
               {%- endif -%}
             {%- endfor -%}
-            | {{ offset | plus: forloop.index }} | {{ f.event_time[0] }} | {{ f['host.name'] | join: ', ' | truncate: 60 | replace: '|', '\\|' | default: '-' }} | {{ f['user.name'] | join: ', ' | truncate: 60 | replace: '|', '\\|' | default: '-' }} | {{ f['kibana.alert.rule.name'][0] | truncate: 100 | replace: '|', '\\|' }} | {{ f['kibana.alert.severity'][0] }} | {{ f['kibana.alert.rule.threat.tactic.name'] | uniq | join: ', ' | truncate: 80 | replace: '|', '\\|' | default: '-' }} | {{ what | default: '-' }} | {{ ad_refs | truncate: 60 }} |
+            | {{ offset | plus: forloop.index }} | {{ f.event_time[0] }} | {{ f['host.name'] | join: ', ' | truncate: 60 | replace: '|', '\\|' | default: '-' }} | {{ f['user.name'] | join: ', ' | truncate: 60 | replace: '|', '\\|' | default: '-' }} | {{ f['kibana.alert.rule.name'][0] | truncate: 100 | replace: '|', '\\|' }} | {{ f['kibana.alert.severity'][0] }} | {{ f['kibana.alert.rule.threat.tactic.name'] | uniq | join: ', ' | truncate: 80 | replace: '|', '\\|' | default: '-' }} | {{ what | default: '-' }} | {{ ad_refs | truncate: 60 | default: '-' }} |
             {% endfor %}
             {%- endcapture -%}
             {{ page | truncate: 29900 }}
 
-      # 6c. Attach this page's alerts to the case (max 100 per request).
+      # 7c. Attach this page's alerts to the case (max 100 per request).
       - name: page_alert_refs
         type: data.map
         items: "${{ steps.timeline_page.output.hits.hits }}"
@@ -284,12 +308,12 @@ steps:
           alerts: "${{ steps.page_alert_refs.output }}"
 
   # ---------------------------------------------------------------------------
-  # 7. Log a link to the new case in the execution view.
+  # 8. Log a link to the new case in the execution view.
   # ---------------------------------------------------------------------------
   - name: done
     type: console
     with:
       message: >-
         Created case "{{ steps.create_case.output.case.title }}" with {{ variables.included_alerts }} alerts
-        from {{ event.alerts | size }} attack discoveries:
+        from {{ variables.discovery_count }} attack discoveries and {{ event.alerts.size | minus: variables.discovery_count }} selected alerts:
         {{ kibanaUrl }}{% if event.spaceId and event.spaceId != 'default' %}/s/{{ event.spaceId }}{% endif %}/app/security/cases/{{ steps.create_case.output.case.id }}
