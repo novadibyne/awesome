@@ -177,8 +177,10 @@ steps:
 
       ---
       Created by the **{{ workflow.name }}** workflow (execution `{{ execution.id }}`).
+    # No lazy quantifiers such as +? here: Kibana 9.4 rejects any pattern with
+    # two quantifiers in a row as a ReDoS risk.
     with:
-      pattern: '\{\{\s*[\w.@-]+\s+([^}\n]+?)\s*\}\}'
+      pattern: '\{\{\s*[\w.@-]+\s+([^}\n]*[^}\s])\s*\}\}'
       replacement: '`$1`'
       flags: g
 
